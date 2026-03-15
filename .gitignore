@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.runs/
+runs/
+outputs/
+data_cache/
+
+*.pt
+*.pth

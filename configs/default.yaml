@@ -1,0 +1,60 @@
+﻿seed: 42
+run:
+  name: g_stvk_flow
+  output_dir: ../runs/g_stvk_flow
+
+data:
+  cache_dir: ../data_cache
+  manifest_train: ../data_cache/train_manifest.jsonl
+  manifest_val: ../data_cache/val_manifest.jsonl
+  frames: 16
+  image_size: 128
+  in_channels: 3
+
+transform:
+  levels: 2
+
+model:
+  base_channels: 96
+  channel_mults: [1, 2, 4]
+  num_res_blocks: 2
+  cond_dim: 256
+  phase_dim: 11
+  num_classes: 0
+  dropout: 0.0
+
+flow:
+  num_knots: 8
+  delta_min: 0.04
+  delta_max: 0.20
+  radius_min: 0.05
+  radius_max: 1.45
+  anisotropy_min: 0.25
+  derivative_eps: 0.01
+  delta_hidden_dim: 32
+  spread_temperature: 0.05
+  reg_grid_size: 21
+
+train:
+  batch_size: 4
+  num_workers: 2
+  epochs: 100
+  lr: 0.0001
+  weight_decay: 0.01
+  grad_clip: 1.0
+  amp: true
+  log_every: 20
+  save_every: 1
+  reg_endpoint: 0.05
+  reg_coverage: 0.02
+  reg_spread: 0.02
+  reg_smooth: 0.001
+  reg_every: 1
+
+inference:
+  steps: 60
+  solver: heun
+  fps: 8
+  kt_softness: 0.08
+  ks_softness: 0.08
+  path_softness: 0.08
