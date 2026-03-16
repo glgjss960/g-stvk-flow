@@ -24,12 +24,8 @@ class GSTVKInterpolant:
     ) -> None:
         self.transform = transform
         self.schedule = schedule
+        # Kept for backward compatibility in constructor signature.
         self.whiten_eps = float(whiten_eps)
-
-    def _band_std(self, x: torch.Tensor) -> torch.Tensor:
-        dims = tuple(range(1, x.ndim))
-        var = x.detach().pow(2).mean(dim=dims, keepdim=True)
-        return (var + self.whiten_eps).sqrt()
 
     def build(self, x_data: torch.Tensor, eps: torch.Tensor, tau: torch.Tensor) -> InterpolantOutput:
         z_data, band_meta = self.transform.forward(x_data)
@@ -51,21 +47,12 @@ class GSTVKInterpolant:
             lam_i = lam[:, i].to(device=band_data.device, dtype=band_data.dtype).view(view_shape)
             lam_dot_i = lam_dot[:, i].to(device=band_data.device, dtype=band_data.dtype).view(view_shape)
 
-            std_data = self._band_std(band_data)
-            std_noise = self._band_std(band_noise)
-
-            x_hat = band_data / std_data
-            n_hat = band_noise / std_noise
-
-            # Variance-preserving harmonic bridge in whitened coordinates.
+            # Variance-preserving harmonic bridge with train/infer-consistent marginals.
             a = torch.sin(0.5 * torch.pi * lam_i)
             b = torch.cos(0.5 * torch.pi * lam_i)
 
-            z_hat = a * x_hat + b * n_hat
-            u_hat = lam_dot_i * (0.5 * torch.pi) * (b * x_hat - a * n_hat)
-
-            z_tau_i = std_data * z_hat
-            u_i = std_data * u_hat
+            z_tau_i = a * band_data + b * band_noise
+            u_i = lam_dot_i * (0.5 * torch.pi) * (b * band_data - a * band_noise)
 
             flat_tau.append(z_tau_i)
             flat_u.append(u_i)

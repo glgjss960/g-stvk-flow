@@ -50,8 +50,13 @@ def _load_model(checkpoint: Path, cfg_path: Path, device: torch.device) -> tuple
     ckpt = load_checkpoint(checkpoint, map_location=device)
     state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state)
-    if isinstance(ckpt, dict) and "schedule" in ckpt:
-        schedule.load_state_dict(ckpt["schedule"])
+
+    if not (isinstance(ckpt, dict) and "schedule" in ckpt):
+        raise KeyError(
+            "Checkpoint does not contain 'schedule'. "
+            "This usually indicates a mismatch between training and current G-STVK-Flow inference code."
+        )
+    schedule.load_state_dict(ckpt["schedule"])
 
     model.eval()
     schedule.eval()
