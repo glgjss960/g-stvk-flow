@@ -134,3 +134,73 @@ Reference file format:
 - `flow.delta_min/delta_max: 0.04/0.20`
 - `train.reg_endpoint/reg_coverage/reg_spread/reg_smooth: 0.05/0.02/0.02/0.001`
 - disentangled inference: `anchor=0.35`, `kt-threshold=0.55`, `ks-min-replace=0.15`
+
+## 6) Evaluation checklist (directly runnable)
+
+### 6.1 Checkpoint gate for standard inference
+
+```bash
+python scripts/eval_checkpoint_gate.py \
+  --checkpoint /path/to/runs/g_stvk_flow/checkpoints/epoch_0048.pt \
+  --config configs/default.yaml \
+  --class-label 0 \
+  --num-samples 16 \
+  --steps 120 \
+  --solver heun \
+  --out-json outputs/eval_gate_epoch_0048.json
+```
+
+Output JSON fields:
+
+- `summary.val_fm_loss`
+- `summary.video_std_mean`
+- `summary.spatial_corr_mean`
+- `summary.temporal_corr_mean`
+- `summary.temporal_diff_mean`
+- `gate.passed` and `gate.rules`
+
+### 6.2 Intrinsic disentanglement evaluation
+
+```bash
+python scripts/eval_disentangle_intrinsic.py \
+  --checkpoint /path/to/runs/g_stvk_flow/checkpoints/epoch_0048.pt \
+  --config configs/default.yaml \
+  --content-labels 0,1 \
+  --motion-labels 2,3,4 \
+  --num-seeds 6 \
+  --steps 120 \
+  --solver heun \
+  --anchor 0.35 \
+  --kt-threshold 0.55 \
+  --ks-min-replace 0.15 \
+  --out-json outputs/eval_disentangle_intrinsic_epoch_0048.json
+```
+
+Output JSON fields:
+
+- `summary.low_band_cos_mean`
+- `summary.high_band_cos_mean`
+- `summary.motion_energy_gap_mean`
+- `summary.pass_rate_mean`
+- per-pair breakdown in `pairs[]`
+
+### 6.3 Semantic motion controllability (requires external classifier)
+
+```bash
+python scripts/eval_disentangle_semantic.py \
+  --checkpoint /path/to/runs/g_stvk_flow/checkpoints/epoch_0048.pt \
+  --config configs/default.yaml \
+  --motion-clf-ts /path/to/ucf101_motion_classifier.ts \
+  --content-labels 0,1 \
+  --motion-labels 2,3,4 \
+  --num-seeds 8 \
+  --steps 120 \
+  --solver heun \
+  --out-json outputs/eval_disentangle_semantic_epoch_0048.json
+```
+
+Output JSON fields:
+
+- `summary.macro_motion_acc`
+- `summary.micro_motion_acc`
+- per-case breakdown in `by_case[]`
