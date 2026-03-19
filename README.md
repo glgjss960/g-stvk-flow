@@ -204,3 +204,71 @@ Output JSON fields:
 - `summary.macro_motion_acc`
 - `summary.micro_motion_acc`
 - per-case breakdown in `by_case[]`
+
+### 6.4 Bidirectional disentanglement (K-Flow style migration)
+
+```bash
+python scripts/eval_disentangle_bidirectional.py \
+  --checkpoint /path/to/runs/g_stvk_flow/checkpoints/epoch_0048.pt \
+  --config configs/default.yaml \
+  --content-labels 0,1,2 \
+  --motion-labels 3,4,5 \
+  --num-seeds 6 \
+  --steps 120 \
+  --solver heun \
+  --anchor 0.35 \
+  --kt-threshold 0.55 \
+  --ks-min-replace 0.15 \
+  --out-json outputs/eval_disentangle_bidirectional_epoch_0048.json
+```
+
+Output JSON fields:
+
+- `direction_A_low_preserve_high_change.summary.*`
+- `direction_B_high_preserve_low_change.summary.*`
+- per-pair breakdown in each `pairs[]`
+
+## 7) Trajectory diagnostics (every ~10% tau + anchor densification)
+
+Standard inference with trajectory export:
+
+```bash
+python scripts/infer.py \
+  --checkpoint /path/to/runs/g_stvk_flow/checkpoints/last.pt \
+  --config configs/default.yaml \
+  --out /path/to/outputs/sample.mp4 \
+  --steps 120 \
+  --solver heun \
+  --class-label 0 \
+  --seed 123 \
+  --trace-dir /path/to/outputs/trace_standard \
+  --trace-percent 10
+```
+
+Disentangled inference with anchor-focused trajectory export:
+
+```bash
+python scripts/infer_disentangled.py \
+  --checkpoint /path/to/runs/g_stvk_flow/checkpoints/last.pt \
+  --config configs/default.yaml \
+  --out /path/to/outputs/disentangled.mp4 \
+  --steps 120 \
+  --solver heun \
+  --content-label 0 \
+  --motion-label 10 \
+  --anchor 0.35 \
+  --kt-threshold 0.55 \
+  --ks-min-replace 0.15 \
+  --seed 123 \
+  --trace-dir /path/to/outputs/trace_disentangled \
+  --trace-percent 10 \
+  --trace-dense-window 0.05
+```
+
+Trace outputs:
+
+- `trace_summary.json`: tau list, cosine values, saved file paths.
+- `videos/*.mp4`: one video per traced tau.
+- `mid_frames/*.png`: quick middle-frame preview for each tau.
+- `cos_curve_*.png`: low/high band cosine curves.
+- disentangled only: `anchor_pre_post_compare.png`.

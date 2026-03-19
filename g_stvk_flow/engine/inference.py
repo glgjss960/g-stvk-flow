@@ -1,10 +1,49 @@
 ﻿from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
 from g_stvk_flow.transforms import BandMeta, Haar3DTransform, SAASchedule
+
+
+@dataclass
+class TracePoint:
+    tau: float
+    tag: str
+    video: torch.Tensor  # [B,C,T,H,W]
+
+
+def _capture_index_map(
+    tau_start: float,
+    tau_end: float,
+    steps: int,
+    trace_taus: Optional[list[float]],
+) -> dict[int, float]:
+    if not trace_taus or steps <= 0:
+        return {}
+
+    span = float(tau_end - tau_start)
+    if abs(span) < 1e-12:
+        return {}
+
+    mapping: dict[int, tuple[float, float]] = {}
+    # idx -> (requested_tau, distance)
+    for tau in trace_taus:
+        tau_f = float(tau)
+        if tau_f < min(tau_start, tau_end) - 1e-6 or tau_f > max(tau_start, tau_end) + 1e-6:
+            continue
+        ratio = (tau_f - tau_start) / span
+        idx = int(round(ratio * steps))
+        idx = max(0, min(steps, idx))
+        tau_actual = float(tau_start + span * (idx / float(steps)))
+        dist = abs(tau_actual - tau_f)
+
+        if idx not in mapping or dist < mapping[idx][1]:
+            mapping[idx] = (tau_f, dist)
+
+    return {idx: req_tau for idx, (req_tau, _d) in mapping.items()}
 
 
 @torch.no_grad()
@@ -18,13 +57,21 @@ def _integrate(
     schedule: SAASchedule,
     band_meta: BandMeta,
     class_labels: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    trace_taus: Optional[list[float]] = None,
+    trace_tag: str = "ode",
+) -> tuple[torch.Tensor, list[TracePoint]]:
     if steps <= 0:
-        return psi
+        return psi, []
 
     taus = torch.linspace(tau_start, tau_end, steps + 1, device=psi.device)
     ks = band_meta.ks.to(psi.device)
     kt = band_meta.kt.to(psi.device)
+
+    capture_map = _capture_index_map(tau_start=tau_start, tau_end=tau_end, steps=steps, trace_taus=trace_taus)
+    traces: list[TracePoint] = []
+
+    if 0 in capture_map:
+        traces.append(TracePoint(tau=float(taus[0].item()), tag=trace_tag, video=psi.detach().clone()))
 
     for i in range(steps):
         t0 = taus[i]
@@ -44,7 +91,52 @@ def _integrate(
         else:
             psi = psi + dt * v0
 
-    return psi
+        next_idx = i + 1
+        if next_idx in capture_map:
+            traces.append(TracePoint(tau=float(t1.item()), tag=trace_tag, video=psi.detach().clone()))
+
+    return psi, traces
+
+
+@torch.no_grad()
+def sample_video_with_trace(
+    model: torch.nn.Module,
+    transform: Haar3DTransform,
+    schedule: SAASchedule,
+    shape: tuple[int, int, int, int, int],
+    steps: int,
+    solver: str,
+    device: torch.device,
+    class_label: Optional[int] = None,
+    seed: Optional[int] = None,
+    trace_taus: Optional[list[float]] = None,
+) -> tuple[torch.Tensor, list[TracePoint]]:
+    if seed is not None:
+        g = torch.Generator(device=device)
+        g.manual_seed(seed)
+        psi = torch.randn(shape, generator=g, device=device)
+    else:
+        psi = torch.randn(shape, device=device)
+
+    labels = None
+    if class_label is not None:
+        labels = torch.full((shape[0],), int(class_label), dtype=torch.long, device=device)
+
+    band_meta = transform.band_meta(device=device)
+    out, traces = _integrate(
+        model=model,
+        psi=psi,
+        tau_start=0.0,
+        tau_end=1.0,
+        steps=steps,
+        solver=solver,
+        schedule=schedule,
+        band_meta=band_meta,
+        class_labels=labels,
+        trace_taus=trace_taus,
+        trace_tag="standard",
+    )
+    return out, traces
 
 
 @torch.no_grad()
@@ -59,33 +151,23 @@ def sample_video(
     class_label: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> torch.Tensor:
-    if seed is not None:
-        g = torch.Generator(device=device)
-        g.manual_seed(seed)
-        psi = torch.randn(shape, generator=g, device=device)
-    else:
-        psi = torch.randn(shape, device=device)
-
-    labels = None
-    if class_label is not None:
-        labels = torch.full((shape[0],), int(class_label), dtype=torch.long, device=device)
-
-    band_meta = transform.band_meta(device=device)
-    return _integrate(
+    out, _ = sample_video_with_trace(
         model=model,
-        psi=psi,
-        tau_start=0.0,
-        tau_end=1.0,
+        transform=transform,
+        schedule=schedule,
+        shape=shape,
         steps=steps,
         solver=solver,
-        schedule=schedule,
-        band_meta=band_meta,
-        class_labels=labels,
+        device=device,
+        class_label=class_label,
+        seed=seed,
+        trace_taus=None,
     )
+    return out
 
 
 @torch.no_grad()
-def sample_video_disentangled(
+def sample_video_disentangled_with_trace(
     model: torch.nn.Module,
     transform: Haar3DTransform,
     schedule: SAASchedule,
@@ -103,7 +185,8 @@ def sample_video_disentangled(
     class_label_motion: Optional[int] = None,
     reference_video: Optional[torch.Tensor] = None,
     seed: Optional[int] = None,
-) -> torch.Tensor:
+    trace_taus: Optional[list[float]] = None,
+) -> tuple[torch.Tensor, list[TracePoint], torch.Tensor, BandMeta]:
     if seed is not None:
         g = torch.Generator(device=device)
         g.manual_seed(seed)
@@ -124,8 +207,14 @@ def sample_video_disentangled(
 
     band_meta = transform.band_meta(device=device)
 
+    trace_taus_a = None
+    trace_taus_c = None
+    if trace_taus:
+        trace_taus_a = [float(t) for t in trace_taus if float(t) <= float(anchor) + 1e-8]
+        trace_taus_c = [float(t) for t in trace_taus if float(t) > float(anchor) + 1e-8]
+
     # Stage A: content anchoring
-    psi_anchor = _integrate(
+    psi_anchor, trace_a = _integrate(
         model=model,
         psi=psi0,
         tau_start=0.0,
@@ -135,6 +224,8 @@ def sample_video_disentangled(
         schedule=schedule,
         band_meta=band_meta,
         class_labels=content_labels,
+        trace_taus=trace_taus_a,
+        trace_tag="stage_a",
     )
 
     z_anchor, meta = transform.forward(psi_anchor)
@@ -176,8 +267,13 @@ def sample_video_disentangled(
     z_edit = transform.unflatten_like(z_anchor, flat_edit)
     psi_edit = transform.inverse(z_edit)
 
+    trace_special = [
+        TracePoint(tau=float(anchor), tag="anchor_pre_edit", video=psi_anchor.detach().clone()),
+        TracePoint(tau=float(anchor), tag="anchor_post_edit", video=psi_edit.detach().clone()),
+    ]
+
     # Stage C: motion injection
-    psi_final = _integrate(
+    psi_final, trace_c = _integrate(
         model=model,
         psi=psi_edit,
         tau_start=anchor,
@@ -187,6 +283,52 @@ def sample_video_disentangled(
         schedule=schedule,
         band_meta=band_meta,
         class_labels=motion_labels,
+        trace_taus=trace_taus_c,
+        trace_tag="stage_c",
     )
 
-    return psi_final
+    traces = trace_a + trace_special + trace_c
+    return psi_final, traces, edit_weights.detach().clone(), meta
+
+
+@torch.no_grad()
+def sample_video_disentangled(
+    model: torch.nn.Module,
+    transform: Haar3DTransform,
+    schedule: SAASchedule,
+    shape: tuple[int, int, int, int, int],
+    steps: int,
+    solver: str,
+    device: torch.device,
+    anchor: float,
+    kt_threshold: float,
+    ks_min_replace: float,
+    kt_softness: float,
+    ks_softness: float,
+    path_softness: float,
+    class_label_content: Optional[int] = None,
+    class_label_motion: Optional[int] = None,
+    reference_video: Optional[torch.Tensor] = None,
+    seed: Optional[int] = None,
+) -> torch.Tensor:
+    out, _tr, _w, _meta = sample_video_disentangled_with_trace(
+        model=model,
+        transform=transform,
+        schedule=schedule,
+        shape=shape,
+        steps=steps,
+        solver=solver,
+        device=device,
+        anchor=anchor,
+        kt_threshold=kt_threshold,
+        ks_min_replace=ks_min_replace,
+        kt_softness=kt_softness,
+        ks_softness=ks_softness,
+        path_softness=path_softness,
+        class_label_content=class_label_content,
+        class_label_motion=class_label_motion,
+        reference_video=reference_video,
+        seed=seed,
+        trace_taus=None,
+    )
+    return out
