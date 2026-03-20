@@ -1,12 +1,12 @@
 ﻿seed: 42
 run:
   name: g_stvk_flow
-  output_dir: ../runs/g_stvk_flow
+  output_dir: /map-vepfs/zhengxuan/st-vk-flow/runs/g_stvk_flow
 
 data:
-  cache_dir: ../data_cache
-  manifest_train: ../data_cache/train_manifest.jsonl
-  manifest_val: ../data_cache/val_manifest.jsonl
+  cache_dir: /map-vepfs/zhengxuan/st-vk-flow/data_cache
+  manifest_train: /map-vepfs/zhengxuan/st-vk-flow/data/UCF101/UCF-101_16_128_0.9/train_manifest.jsonl
+  manifest_val: /map-vepfs/zhengxuan/st-vk-flow/data/UCF101/UCF-101_16_128_0.9/val_manifest.jsonl
   frames: 16
   image_size: 128
   in_channels: 3
@@ -20,7 +20,7 @@ model:
   num_res_blocks: 2
   cond_dim: 256
   phase_dim: 11
-  num_classes: 0
+  num_classes: 101
   dropout: 0.0
 
 flow:

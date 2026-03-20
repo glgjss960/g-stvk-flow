@@ -54,6 +54,7 @@ def _regularization_loss(cfg: Config, interpolant: GSTVKInterpolant, device: tor
         + cfg.train.reg_coverage * reg_terms["coverage"]
         + cfg.train.reg_spread * reg_terms["spread"]
         + cfg.train.reg_smooth * reg_terms["smooth"]
+        + cfg.train.reg_mono * reg_terms["mono"]
     )
 
     metrics = {
@@ -61,6 +62,7 @@ def _regularization_loss(cfg: Config, interpolant: GSTVKInterpolant, device: tor
         "reg_coverage": float(reg_terms["coverage"].item()),
         "reg_spread": float(reg_terms["spread"].item()),
         "reg_smooth": float(reg_terms["smooth"].item()),
+        "reg_mono": float(reg_terms["mono"].item()),
     }
     return loss, metrics
 
@@ -134,6 +136,7 @@ def train_loop(
                 if reg_metrics:
                     payload["reg_ep"] = f"{reg_metrics['reg_endpoint']:.4f}"
                     payload["reg_cov"] = f"{reg_metrics['reg_coverage']:.4f}"
+                    payload["reg_mon"] = f"{reg_metrics['reg_mono']:.4f}"
                 pbar.set_postfix(payload)
                 running_fm = 0.0
                 running_total = 0.0

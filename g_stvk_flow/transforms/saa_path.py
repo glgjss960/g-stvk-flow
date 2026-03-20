@@ -25,7 +25,12 @@ class GeometricPathScheduler(nn.Module):
 
     The front is defined by a moving anisotropic ball:
       score = (radius - distance) / delta
-      lambda = sigmoid(score)
+
+    Final lambda is *not* a direct sigmoid(score). Instead we use
+    a smooth hard-boundary parameterization:
+      r_i(t) = softplus(score_i(t)) + eps
+      lambda_i(t) = Integral_0^t r_i(s) ds / Integral_0^1 r_i(s) ds
+    so lambda_i(0)=0, lambda_i(1)=1, and lambda_i is monotone.
     """
 
     def __init__(
@@ -40,6 +45,8 @@ class GeometricPathScheduler(nn.Module):
         delta_hidden_dim: int,
         spread_temperature: float,
         reg_grid_size: int,
+        integration_grid_size: int = 129,
+        rate_floor: float = 1e-4,
     ) -> None:
         super().__init__()
         if num_knots < 2:
@@ -56,6 +63,8 @@ class GeometricPathScheduler(nn.Module):
         self.derivative_eps = float(derivative_eps)
         self.spread_temperature = float(spread_temperature)
         self.reg_grid_size = int(reg_grid_size)
+        self.integration_grid_size = max(17, int(integration_grid_size))
+        self.rate_floor = float(rate_floor)
 
         # Monotone curves are parameterized by positive increments on knot segments.
         self.gamma_s_logits = nn.Parameter(torch.zeros(self.num_knots))
@@ -130,9 +139,38 @@ class GeometricPathScheduler(nn.Module):
             score=score,
         )
 
+    @staticmethod
+    def _cumtrapz(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        # y: [N, K], x: [N]
+        if y.ndim != 2:
+            raise ValueError(f"Expected y with shape [N,K], got {tuple(y.shape)}")
+        if x.ndim != 1 or x.shape[0] != y.shape[0]:
+            raise ValueError(f"Expected x with shape [N], got {tuple(x.shape)} for y={tuple(y.shape)}")
+        dx = x[1:] - x[:-1]
+        area = 0.5 * (y[1:] + y[:-1]) * dx[:, None]
+        prefix = torch.zeros(1, y.shape[1], dtype=y.dtype, device=y.device)
+        return torch.cat([prefix, torch.cumsum(area, dim=0)], dim=0)
+
+    @staticmethod
+    def _interp_grid(values: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        # values: [N, K], t: [B] in [0,1]
+        if values.ndim != 2:
+            raise ValueError(f"Expected values with shape [N,K], got {tuple(values.shape)}")
+        if t.ndim != 1:
+            raise ValueError(f"Expected t with shape [B], got {tuple(t.shape)}")
+        n = values.shape[0]
+        if n < 2:
+            raise ValueError("Need at least 2 grid points for interpolation.")
+        pos = t.clamp(0.0, 1.0) * float(n - 1)
+        idx0 = pos.floor().long().clamp(min=0, max=n - 2)
+        frac = (pos - idx0.to(pos.dtype)).unsqueeze(1)
+        v0 = values.index_select(0, idx0)
+        v1 = values.index_select(0, idx0 + 1)
+        return v0 + (v1 - v0) * frac
+
     def _lambda_only(self, tau: torch.Tensor, ks: torch.Tensor, kt: torch.Tensor) -> torch.Tensor:
-        state = self._path_state(tau=tau, ks=ks, kt=kt)
-        return torch.sigmoid(state.score)
+        lam, _lam_dot, _state = self.lambda_and_derivative(tau=tau, ks=ks, kt=kt)
+        return lam
 
     def lambda_and_derivative(
         self,
@@ -141,15 +179,20 @@ class GeometricPathScheduler(nn.Module):
         kt: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, GeometricPathState]:
         state = self._path_state(tau=tau, ks=ks, kt=kt)
-        lam = torch.sigmoid(state.score)
 
-        eps = max(self.derivative_eps, 1e-4)
-        tau_plus = (tau + eps).clamp(0.0, 1.0)
-        tau_minus = (tau - eps).clamp(0.0, 1.0)
+        rate_tau = F.softplus(state.score) + max(self.rate_floor, 1e-8)
 
-        lam_plus = self._lambda_only(tau=tau_plus, ks=ks, kt=kt)
-        lam_minus = self._lambda_only(tau=tau_minus, ks=ks, kt=kt)
-        lam_dot = (lam_plus - lam_minus) / (2.0 * eps)
+        grid_n = max(17, int(self.integration_grid_size))
+        tau_grid = torch.linspace(0.0, 1.0, grid_n, device=tau.device, dtype=tau.dtype)
+        state_grid = self._path_state(tau=tau_grid, ks=ks, kt=kt)
+        rate_grid = F.softplus(state_grid.score) + max(self.rate_floor, 1e-8)
+
+        integral_grid = self._cumtrapz(rate_grid, tau_grid)
+        denom = integral_grid[-1].clamp_min(1e-8)  # [K]
+
+        num = self._interp_grid(integral_grid, t=tau)  # [B,K]
+        lam = (num / denom[None, :]).clamp(0.0, 1.0)
+        lam_dot = (rate_tau / denom[None, :]).clamp_min(0.0)
 
         return lam, lam_dot, state
 
@@ -220,11 +263,14 @@ class GeometricPathScheduler(nn.Module):
         smooth_delta = second_diff(state.delta.mean(dim=1)).square().mean()
         smooth = smooth_path + smooth_delta
 
+        mono = F.relu(lam[:-1] - lam[1:]).square().mean()
+
         return {
             "endpoint": endpoint,
             "coverage": coverage,
             "spread": spread,
             "smooth": smooth,
+            "mono": mono,
         }
 
     def build_edit_weights(
@@ -253,4 +299,3 @@ class GeometricPathScheduler(nn.Module):
 
 # Backward-compatible alias for earlier code paths.
 SAASchedule = GeometricPathScheduler
-

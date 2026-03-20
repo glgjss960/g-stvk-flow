@@ -40,10 +40,42 @@ def _build_schedule(cfg: object, device: torch.device) -> SAASchedule:
         delta_hidden_dim=cfg.flow.delta_hidden_dim,
         spread_temperature=cfg.flow.spread_temperature,
         reg_grid_size=cfg.flow.reg_grid_size,
+        integration_grid_size=getattr(cfg.flow, 'integration_grid_size', 129),
+        rate_floor=getattr(cfg.flow, 'rate_floor', 1e-4),
     ).to(device)
 
 
+def _state_num_classes(state: object) -> int | None:
+    if not isinstance(state, dict):
+        return None
+    w = state.get("class_embed.weight")
+    if isinstance(w, torch.Tensor) and w.ndim == 2:
+        return int(w.shape[0])
+    return None
+
+
 def _load_model(checkpoint: Path, cfg: object, device: torch.device) -> tuple[torch.nn.Module, SAASchedule]:
+    ckpt = load_checkpoint(checkpoint, map_location=device)
+    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+
+    cfg_num_classes = int(cfg.model.num_classes)
+    ckpt_num_classes = _state_num_classes(state)
+
+    if ckpt_num_classes is None and cfg_num_classes > 0:
+        model_num_classes = 0
+        print(
+            "[warn] checkpoint has no class_embed.weight but config sets model.num_classes>0; "
+            "forcing num_classes=0 for compatible loading."
+        )
+    elif ckpt_num_classes is not None and ckpt_num_classes != cfg_num_classes:
+        model_num_classes = ckpt_num_classes
+        print(
+            f"[warn] config model.num_classes={cfg_num_classes} mismatches checkpoint class_embed={ckpt_num_classes}; "
+            f"using checkpoint value {ckpt_num_classes}."
+        )
+    else:
+        model_num_classes = cfg_num_classes
+
     model = STVKFlowModel(
         in_channels=cfg.data.in_channels,
         base_channels=cfg.model.base_channels,
@@ -51,13 +83,12 @@ def _load_model(checkpoint: Path, cfg: object, device: torch.device) -> tuple[to
         num_res_blocks=cfg.model.num_res_blocks,
         cond_dim=cfg.model.cond_dim,
         phase_dim=cfg.model.phase_dim,
-        num_classes=cfg.model.num_classes,
+        num_classes=model_num_classes,
         dropout=cfg.model.dropout,
     ).to(device)
+
     schedule = _build_schedule(cfg, device)
 
-    ckpt = load_checkpoint(checkpoint, map_location=device)
-    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state)
 
     if not (isinstance(ckpt, dict) and "schedule" in ckpt):
@@ -121,6 +152,33 @@ def _video_std(v: torch.Tensor) -> float:
     return float(v.std().item())
 
 
+def _q(x: torch.Tensor, q: float) -> float:
+    return float(torch.quantile(x.reshape(-1).float(), torch.tensor(q, device=x.device)).item())
+
+
+def _schedule_endpoint_stats(schedule: SAASchedule, transform: Haar3DTransform, device: torch.device) -> Dict[str, float]:
+    with torch.no_grad():
+        meta = transform.band_meta(device=device)
+        ks = meta.ks
+        kt = meta.kt
+
+        tau0 = torch.zeros(1, device=device)
+        tau1 = torch.ones(1, device=device)
+
+        lam0, _dot0, _s0 = schedule.lambda_and_derivative(tau=tau0, ks=ks, kt=kt)
+        lam1, _dot1, _s1 = schedule.lambda_and_derivative(tau=tau1, ks=ks, kt=kt)
+
+        lam0 = lam0[0]
+        lam1 = lam1[0]
+
+        return {
+            "lambda0_mean": float(lam0.mean().item()),
+            "lambda0_p95": _q(lam0, 0.95),
+            "lambda1_mean": float(lam1.mean().item()),
+            "lambda1_p05": _q(lam1, 0.05),
+        }
+
+
 def _judge(summary: Dict[str, float]) -> Dict[str, object]:
     rules = {
         "val_fm_loss": summary["val_fm_loss"] <= 0.08,
@@ -128,6 +186,10 @@ def _judge(summary: Dict[str, float]) -> Dict[str, object]:
         "spatial_corr": summary["spatial_corr_mean"] >= 0.12,
         "temporal_corr": summary["temporal_corr_mean"] >= 0.05,
         "temporal_diff": summary["temporal_diff_mean"] >= 0.02,
+        "lambda0_mean": summary["lambda0_mean"] <= 0.02,
+        "lambda0_p95": summary["lambda0_p95"] <= 0.05,
+        "lambda1_mean": summary["lambda1_mean"] >= 0.98,
+        "lambda1_p05": summary["lambda1_p05"] >= 0.95,
     }
     passed = all(rules.values())
     return {
@@ -157,8 +219,13 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, schedule = _load_model(args.checkpoint, cfg, device)
 
+    if args.class_label is not None and int(getattr(model, "num_classes", 0)) <= 0:
+        raise ValueError("Checkpoint is unconditional (no class embedding), but --class-label was provided.")
+
     transform = Haar3DTransform(levels=cfg.transform.levels)
     interpolant = STVKInterpolant(transform=transform, schedule=schedule)
+
+    endpoint_stats = _schedule_endpoint_stats(schedule=schedule, transform=transform, device=device)
 
     val_manifest = args.val_manifest if args.val_manifest is not None else _resolve(cfg_path, cfg.data.manifest_val)
     val_ds = CachedVideoDataset(val_manifest)
@@ -210,6 +277,7 @@ def main() -> None:
         "spatial_corr_mean": float(statistics.mean(scorrs)),
         "temporal_corr_mean": float(statistics.mean(tcorrs)),
         "temporal_diff_mean": float(statistics.mean(tdiffs)),
+        **endpoint_stats,
     }
 
     gate = _judge(summary)
@@ -222,6 +290,10 @@ def main() -> None:
             "spatial_corr_mean": ">= 0.12",
             "temporal_corr_mean": ">= 0.05",
             "temporal_diff_mean": ">= 0.02",
+            "lambda0_mean": "<= 0.02",
+            "lambda0_p95": "<= 0.05",
+            "lambda1_mean": ">= 0.98",
+            "lambda1_p05": ">= 0.95",
         },
     }
 

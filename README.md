@@ -6,7 +6,7 @@ This implementation focuses on three core upgrades:
 
 - Geometric band path: a learnable front on `(k_s, k_t)` with monotone motion.
 - Path regularization: endpoint, coverage, spread, and smoothness losses.
-- Whitened harmonic bridge: variance-preserving interpolation in whitened K-space.
+- VP harmonic bridge with hard-boundary lambda: smooth monotone schedule with lambda(0)=0 and lambda(1)=1.
 
 ## Project layout
 
@@ -272,3 +272,4 @@ Trace outputs:
 - `mid_frames/*.png`: quick middle-frame preview for each tau.
 - `cos_curve_*.png`: low/high band cosine curves.
 - disentangled only: `anchor_pre_post_compare.png`.
+

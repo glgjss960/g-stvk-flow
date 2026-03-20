@@ -37,6 +37,8 @@ def _build_schedule(cfg: object, device: torch.device) -> SAASchedule:
         delta_hidden_dim=cfg.flow.delta_hidden_dim,
         spread_temperature=cfg.flow.spread_temperature,
         reg_grid_size=cfg.flow.reg_grid_size,
+        integration_grid_size=getattr(cfg.flow, 'integration_grid_size', 129),
+        rate_floor=getattr(cfg.flow, 'rate_floor', 1e-4),
     ).to(device)
 
 
@@ -481,3 +483,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

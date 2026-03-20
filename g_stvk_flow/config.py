@@ -51,6 +51,8 @@ class FlowConfig:
     delta_hidden_dim: int
     spread_temperature: float
     reg_grid_size: int
+    integration_grid_size: int = 129
+    rate_floor: float = 1e-4
 
 
 @dataclass
@@ -69,6 +71,7 @@ class TrainConfig:
     reg_spread: float
     reg_smooth: float
     reg_every: int
+    reg_mono: float = 0.0
 
 
 @dataclass
@@ -100,13 +103,21 @@ def _load_yaml(path: str | Path) -> Dict[str, Any]:
 
 def load_config(path: str | Path) -> Config:
     raw = _load_yaml(path)
+
+    flow_raw = dict(raw["flow"])
+    flow_raw.setdefault("integration_grid_size", 129)
+    flow_raw.setdefault("rate_floor", 1e-4)
+
+    train_raw = dict(raw["train"])
+    train_raw.setdefault("reg_mono", 0.0)
+
     return Config(
         seed=int(raw["seed"]),
         run=RunConfig(**raw["run"]),
         data=DataConfig(**raw["data"]),
         transform=TransformConfig(**raw["transform"]),
         model=ModelConfig(**raw["model"]),
-        flow=FlowConfig(**raw["flow"]),
-        train=TrainConfig(**raw["train"]),
+        flow=FlowConfig(**flow_raw),
+        train=TrainConfig(**train_raw),
         inference=InferenceConfig(**raw["inference"]),
     )
