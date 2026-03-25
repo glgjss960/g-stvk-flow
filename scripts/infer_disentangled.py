@@ -43,6 +43,8 @@ def _build_schedule(cfg: object, device: torch.device) -> SAASchedule:
         reg_grid_size=cfg.flow.reg_grid_size,
         integration_grid_size=getattr(cfg.flow, 'integration_grid_size', 129),
         rate_floor=getattr(cfg.flow, 'rate_floor', 1e-4),
+        lambda_replace_thr=getattr(cfg.flow, 'lambda_replace_thr', 0.55),
+        tail_start=getattr(cfg.flow, 'tail_start', 0.85),
     ).to(device)
 
 
@@ -92,6 +94,124 @@ def _find_trace(points: list[TracePoint], tag: str) -> TracePoint | None:
     return None
 
 
+def _parse_anchor_grid(text: str | None) -> list[float]:
+    default = [0.25, 0.30, 0.35, 0.40, 0.45, 0.50]
+    if text is None or text.strip() == "":
+        return default
+
+    vals: list[float] = []
+    for tok in text.split(","):
+        s = tok.strip()
+        if s == "":
+            continue
+        try:
+            v = float(s)
+        except ValueError as exc:
+            raise ValueError(f"Invalid anchor-grid value: {s}") from exc
+        if 0.0 < v < 1.0:
+            vals.append(v)
+
+    vals = sorted(set(float(v) for v in vals))
+    if not vals:
+        raise ValueError("anchor-grid must include at least one value in (0,1)")
+    return vals
+
+
+def _resolve_anchor(
+    anchor_arg: str,
+    schedule: SAASchedule,
+    transform: Haar3DTransform,
+    device: torch.device,
+    kt_threshold: float,
+    ks_min_replace: float,
+    kt_softness: float,
+    ks_softness: float,
+    path_softness: float,
+    anchor_grid: str | None,
+    anchor_low_min: float,
+    anchor_min_edit_mass: float,
+) -> tuple[float, dict]:
+    mode = anchor_arg.strip().lower()
+    if mode != "auto":
+        try:
+            anchor = float(anchor_arg)
+        except ValueError as exc:
+            raise ValueError(f"Invalid --anchor value: {anchor_arg}. Use float in (0,1) or 'auto'.") from exc
+        if not (0.0 < anchor < 1.0):
+            raise ValueError(f"--anchor must be in (0,1), got {anchor}")
+        return anchor, {"mode": "fixed", "selected_anchor": float(anchor)}
+
+    with torch.no_grad():
+        meta = transform.band_meta(device=device)
+        low_mask, high_mask = make_low_high_masks(meta=meta, kt_threshold=kt_threshold, ks_min_replace=ks_min_replace)
+
+        if not bool(high_mask.any()):
+            high_mask = torch.ones_like(high_mask, dtype=torch.bool)
+        if not bool(low_mask.any()):
+            low_mask = torch.ones_like(low_mask, dtype=torch.bool)
+
+        candidates = _parse_anchor_grid(anchor_grid)
+        rows: list[dict] = []
+
+        for a in candidates:
+            tau = torch.tensor([float(a)], device=device, dtype=meta.ks.dtype)
+            lam, _lam_dot, _state = schedule.lambda_and_derivative(tau=tau, ks=meta.ks, kt=meta.kt)
+            lam_anchor = lam[0]
+
+            edit_w = schedule.build_edit_weights(
+                ks=meta.ks,
+                kt=meta.kt,
+                tau_anchor=float(a),
+                kt_threshold=kt_threshold,
+                ks_min_replace=ks_min_replace,
+                kt_softness=kt_softness,
+                ks_softness=ks_softness,
+                path_softness=path_softness,
+            )
+
+            low_lock = float(lam_anchor[low_mask].mean().item())
+            high_open = float((1.0 - lam_anchor[high_mask]).mean().item())
+            edit_mass = float(edit_w[high_mask].mean().item())
+
+            # Higher score means: low band is already stabilized, high band still open and editable.
+            score = 0.5 * edit_mass + 0.3 * high_open + 0.2 * low_lock
+            feasible = (low_lock >= float(anchor_low_min)) and (edit_mass >= float(anchor_min_edit_mass))
+
+            rows.append(
+                {
+                    "anchor": float(a),
+                    "low_lock": low_lock,
+                    "high_open": high_open,
+                    "edit_mass": edit_mass,
+                    "score": float(score),
+                    "feasible": bool(feasible),
+                }
+            )
+
+        feasible_rows = [r for r in rows if bool(r["feasible"])]
+        pick_pool = feasible_rows if feasible_rows else rows
+        best = max(pick_pool, key=lambda r: float(r["score"]))
+
+        info = {
+            "mode": "auto",
+            "selected_anchor": float(best["anchor"]),
+            "selected_stats": {
+                "low_lock": float(best["low_lock"]),
+                "high_open": float(best["high_open"]),
+                "edit_mass": float(best["edit_mass"]),
+                "score": float(best["score"]),
+                "feasible": bool(best["feasible"]),
+            },
+            "constraints": {
+                "anchor_low_min": float(anchor_low_min),
+                "anchor_min_edit_mass": float(anchor_min_edit_mass),
+            },
+            "candidates": rows,
+            "has_feasible": bool(len(feasible_rows) > 0),
+        }
+        return float(best["anchor"]), info
+
+
 def _save_trace_artifacts(
     trace_points: list[TracePoint],
     out_dir: Path,
@@ -101,10 +221,12 @@ def _save_trace_artifacts(
     kt_threshold: float,
     ks_min_replace: float,
     edit_weights: torch.Tensor,
+    save_scale: float,
+    anchor_info: dict,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    saved = save_trace_videos(trace_points=trace_points, out_dir=out_dir, fps=fps)
+    saved = save_trace_videos(trace_points=trace_points, out_dir=out_dir, fps=fps, scale=save_scale)
 
     anchor_pre = _find_trace(trace_points, "anchor_pre_edit")
     anchor_post = _find_trace(trace_points, "anchor_post_edit")
@@ -116,6 +238,7 @@ def _save_trace_artifacts(
         pre_video=anchor_pre.video[0].detach().cpu(),
         post_video=anchor_post.video[0].detach().cpu(),
         out_png=anchor_png,
+        scale=save_scale,
     )
 
     meta = transform.band_meta(device=device)
@@ -175,6 +298,8 @@ def _save_trace_artifacts(
             "ks_min_replace": float(ks_min_replace),
         },
         "edit_weights": [float(x) for x in edit_weights.detach().cpu().tolist()],
+        "save_scale": float(save_scale),
+        "anchor_selection": anchor_info,
     }
     (out_dir / "trace_summary.json").write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 
@@ -186,7 +311,10 @@ def main() -> None:
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--solver", type=str, default=None, choices=["euler", "heun"])
-    parser.add_argument("--anchor", type=float, default=0.35)
+    parser.add_argument("--anchor", type=str, default="0.35", help="Anchor tau in (0,1), or 'auto' for grid search")
+    parser.add_argument("--anchor-grid", type=str, default="0.25,0.30,0.35,0.40,0.45,0.50")
+    parser.add_argument("--anchor-low-min", type=float, default=0.45)
+    parser.add_argument("--anchor-min-edit-mass", type=float, default=0.15)
     parser.add_argument("--kt-threshold", type=float, default=0.55)
     parser.add_argument("--ks-min-replace", type=float, default=0.15)
     parser.add_argument("--kt-softness", type=float, default=None)
@@ -196,6 +324,7 @@ def main() -> None:
     parser.add_argument("--motion-label", type=int, default=None)
     parser.add_argument("--reference-pt", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--save-scale", type=float, default=1.0, help="Output upsample factor for visualization/export")
 
     parser.add_argument("--trace-dir", type=Path, default=None)
     parser.add_argument("--trace-percent", type=float, default=10.0, help="Save trajectory near every N percent in tau")
@@ -231,6 +360,22 @@ def main() -> None:
 
     transform = Haar3DTransform(levels=cfg.transform.levels)
 
+    anchor, anchor_info = _resolve_anchor(
+        anchor_arg=args.anchor,
+        schedule=schedule,
+        transform=transform,
+        device=device,
+        kt_threshold=args.kt_threshold,
+        ks_min_replace=args.ks_min_replace,
+        kt_softness=kt_softness,
+        ks_softness=ks_softness,
+        path_softness=path_softness,
+        anchor_grid=args.anchor_grid,
+        anchor_low_min=args.anchor_low_min,
+        anchor_min_edit_mass=args.anchor_min_edit_mass,
+    )
+    print(f"Using anchor={anchor:.4f} (mode={anchor_info['mode']})")
+
     if args.trace_dir is None:
         sample = sample_video_disentangled(
             model=model,
@@ -240,7 +385,7 @@ def main() -> None:
             steps=steps,
             solver=solver,
             device=device,
-            anchor=args.anchor,
+            anchor=anchor,
             kt_threshold=args.kt_threshold,
             ks_min_replace=args.ks_min_replace,
             kt_softness=kt_softness,
@@ -254,7 +399,7 @@ def main() -> None:
     else:
         trace_taus = build_trace_taus(
             step_percent=args.trace_percent,
-            anchor=args.anchor,
+            anchor=anchor,
             dense_window=args.trace_dense_window,
         )
         sample, traces, edit_weights, _meta = sample_video_disentangled_with_trace(
@@ -265,7 +410,7 @@ def main() -> None:
             steps=steps,
             solver=solver,
             device=device,
-            anchor=args.anchor,
+            anchor=anchor,
             kt_threshold=args.kt_threshold,
             ks_min_replace=args.ks_min_replace,
             kt_softness=kt_softness,
@@ -288,9 +433,11 @@ def main() -> None:
             kt_threshold=args.kt_threshold,
             ks_min_replace=args.ks_min_replace,
             edit_weights=edit_weights,
+            save_scale=args.save_scale,
+            anchor_info=anchor_info,
         )
 
-    save_video_tensor(sample[0], args.out, fps=cfg.inference.fps)
+    save_video_tensor(sample[0], args.out, fps=cfg.inference.fps, scale=args.save_scale)
     print(f"Saved disentangled sample to {args.out}")
     if args.trace_dir is not None:
         print(f"Saved trace artifacts to {args.trace_dir}")
@@ -298,4 +445,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

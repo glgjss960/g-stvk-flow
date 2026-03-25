@@ -53,6 +53,8 @@ class FlowConfig:
     reg_grid_size: int
     integration_grid_size: int = 129
     rate_floor: float = 1e-4
+    lambda_replace_thr: float = 0.55
+    tail_start: float = 0.85
 
 
 @dataclass
@@ -72,6 +74,8 @@ class TrainConfig:
     reg_smooth: float
     reg_every: int
     reg_mono: float = 0.0
+    reg_tail: float = 0.0
+    reg_end_slope: float = 0.0
 
 
 @dataclass
@@ -107,9 +111,13 @@ def load_config(path: str | Path) -> Config:
     flow_raw = dict(raw["flow"])
     flow_raw.setdefault("integration_grid_size", 129)
     flow_raw.setdefault("rate_floor", 1e-4)
+    flow_raw.setdefault("lambda_replace_thr", 0.55)
+    flow_raw.setdefault("tail_start", 0.85)
 
     train_raw = dict(raw["train"])
     train_raw.setdefault("reg_mono", 0.0)
+    train_raw.setdefault("reg_tail", 0.0)
+    train_raw.setdefault("reg_end_slope", 0.0)
 
     return Config(
         seed=int(raw["seed"]),
@@ -121,3 +129,4 @@ def load_config(path: str | Path) -> Config:
         train=TrainConfig(**train_raw),
         inference=InferenceConfig(**raw["inference"]),
     )
+

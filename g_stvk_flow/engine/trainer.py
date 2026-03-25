@@ -55,6 +55,8 @@ def _regularization_loss(cfg: Config, interpolant: GSTVKInterpolant, device: tor
         + cfg.train.reg_spread * reg_terms["spread"]
         + cfg.train.reg_smooth * reg_terms["smooth"]
         + cfg.train.reg_mono * reg_terms["mono"]
+        + cfg.train.reg_tail * reg_terms["tail_quiet"]
+        + cfg.train.reg_end_slope * reg_terms["end_slope"]
     )
 
     metrics = {
@@ -63,6 +65,8 @@ def _regularization_loss(cfg: Config, interpolant: GSTVKInterpolant, device: tor
         "reg_spread": float(reg_terms["spread"].item()),
         "reg_smooth": float(reg_terms["smooth"].item()),
         "reg_mono": float(reg_terms["mono"].item()),
+        "reg_tail": float(reg_terms["tail_quiet"].item()),
+        "reg_end_slope": float(reg_terms["end_slope"].item()),
     }
     return loss, metrics
 
@@ -137,6 +141,8 @@ def train_loop(
                     payload["reg_ep"] = f"{reg_metrics['reg_endpoint']:.4f}"
                     payload["reg_cov"] = f"{reg_metrics['reg_coverage']:.4f}"
                     payload["reg_mon"] = f"{reg_metrics['reg_mono']:.4f}"
+                    payload["reg_tail"] = f"{reg_metrics['reg_tail']:.4f}"
+                    payload["reg_end"] = f"{reg_metrics['reg_end_slope']:.4f}"
                 pbar.set_postfix(payload)
                 running_fm = 0.0
                 running_total = 0.0
@@ -164,3 +170,4 @@ def train_loop(
             }
             save_checkpoint(state, ckpt_dir / "last.pt")
             save_checkpoint(state, ckpt_dir / f"epoch_{epoch + 1:04d}.pt")
+

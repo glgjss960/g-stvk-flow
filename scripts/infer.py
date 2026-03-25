@@ -42,6 +42,8 @@ def _build_schedule(cfg: object, device: torch.device) -> SAASchedule:
         reg_grid_size=cfg.flow.reg_grid_size,
         integration_grid_size=getattr(cfg.flow, 'integration_grid_size', 129),
         rate_floor=getattr(cfg.flow, 'rate_floor', 1e-4),
+        lambda_replace_thr=getattr(cfg.flow, 'lambda_replace_thr', 0.55),
+        tail_start=getattr(cfg.flow, 'tail_start', 0.85),
     ).to(device)
 
 
@@ -92,10 +94,11 @@ def _save_trace_artifacts(
     device: torch.device,
     kt_threshold: float,
     ks_min_replace: float,
+    save_scale: float,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    saved = save_trace_videos(trace_points=trace_points, out_dir=out_dir, fps=fps)
+    saved = save_trace_videos(trace_points=trace_points, out_dir=out_dir, fps=fps, scale=save_scale)
 
     meta = transform.band_meta(device=device)
     low_mask, high_mask = make_low_high_masks(meta=meta, kt_threshold=kt_threshold, ks_min_replace=ks_min_replace)
@@ -144,6 +147,7 @@ def _save_trace_artifacts(
             "kt_threshold": float(kt_threshold),
             "ks_min_replace": float(ks_min_replace),
         },
+        "save_scale": float(save_scale),
     }
     (out_dir / "trace_summary.json").write_text(json.dumps(payload, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
 
@@ -157,6 +161,7 @@ def main() -> None:
     parser.add_argument("--solver", type=str, default=None, choices=["euler", "heun"])
     parser.add_argument("--class-label", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--save-scale", type=float, default=1.0, help="Output upsample factor for visualization/export")
 
     parser.add_argument("--trace-dir", type=Path, default=None)
     parser.add_argument("--trace-percent", type=float, default=10.0, help="Save trajectory near every N percent in tau")
@@ -217,9 +222,10 @@ def main() -> None:
             device=device,
             kt_threshold=args.trace_kt_threshold,
             ks_min_replace=args.trace_ks_min_replace,
+            save_scale=args.save_scale,
         )
 
-    save_video_tensor(sample[0], args.out, fps=cfg.inference.fps)
+    save_video_tensor(sample[0], args.out, fps=cfg.inference.fps, scale=args.save_scale)
     print(f"Saved sample to {args.out}")
     if args.trace_dir is not None:
         print(f"Saved trace artifacts to {args.trace_dir}")
@@ -227,4 +233,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
 

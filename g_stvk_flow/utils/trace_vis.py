@@ -6,6 +6,7 @@ from typing import Dict, Iterable, List, Sequence
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 from g_stvk_flow.transforms import BandMeta, Haar3DTransform
@@ -51,9 +52,29 @@ def build_trace_taus(step_percent: float, anchor: float | None = None, dense_win
     return sorted(float(t) for t in taus)
 
 
-def _to_uint8_frames(video: torch.Tensor) -> np.ndarray:
+def _resize_video_spatial(video: torch.Tensor, scale: float) -> torch.Tensor:
+    if float(scale) <= 0.0:
+        raise ValueError(f"scale must be > 0, got {scale}")
+    if abs(float(scale) - 1.0) < 1e-8:
+        return video
+
+    c, t, h, w = video.shape
+    new_h = max(1, int(round(h * float(scale))))
+    new_w = max(1, int(round(w * float(scale))))
+
+    frames = video.permute(1, 0, 2, 3).contiguous()  # [T,C,H,W]
+    if new_h > 1 and new_w > 1:
+        frames = F.interpolate(frames, size=(new_h, new_w), mode="bilinear", align_corners=False)
+    else:
+        frames = F.interpolate(frames, size=(new_h, new_w), mode="nearest")
+    return frames.permute(1, 0, 2, 3).contiguous()
+
+
+def _to_uint8_frames(video: torch.Tensor, scale: float = 1.0) -> np.ndarray:
     # video: [C,T,H,W] in [-1,1]
-    v = video.detach().cpu().clamp(-1.0, 1.0)
+    v = video.detach().cpu().to(torch.float32)
+    v = _resize_video_spatial(v, scale=float(scale))
+    v = v.clamp(-1.0, 1.0)
     v = ((v + 1.0) * 127.5).round().to(torch.uint8)
     v = v.permute(1, 2, 3, 0).contiguous()  # [T,H,W,C]
     return v.numpy()
@@ -73,6 +94,7 @@ def save_trace_videos(
     trace_points: Sequence[object],
     out_dir: Path,
     fps: int,
+    scale: float = 1.0,
 ) -> list[TraceSavedItem]:
     out_dir.mkdir(parents=True, exist_ok=True)
     vids_dir = out_dir / "videos"
@@ -90,9 +112,9 @@ def save_trace_videos(
         stem = f"{i:03d}_tau_{tau_str}_{tag}"
 
         video_path = vids_dir / f"{stem}.mp4"
-        save_video_tensor(video, video_path, fps=fps)
+        save_video_tensor(video, video_path, fps=fps, scale=scale)
 
-        frames = _to_uint8_frames(video)
+        frames = _to_uint8_frames(video, scale=scale)
         mid_idx = int(frames.shape[0] // 2)
         mid_img = Image.fromarray(frames[mid_idx])
         mid_path = mids_dir / f"{stem}_mid.png"
@@ -142,10 +164,10 @@ def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((a @ b / den).item())
 
 
-def save_anchor_compare_panel(pre_video: torch.Tensor, post_video: torch.Tensor, out_png: Path) -> None:
+def save_anchor_compare_panel(pre_video: torch.Tensor, post_video: torch.Tensor, out_png: Path, scale: float = 1.0) -> None:
     # pre/post: [C,T,H,W] in [-1,1]
-    pre = _to_uint8_frames(pre_video)
-    post = _to_uint8_frames(post_video)
+    pre = _to_uint8_frames(pre_video, scale=scale)
+    post = _to_uint8_frames(post_video, scale=scale)
     t = pre.shape[0]
     idxs = sorted(set([0, t // 2, max(0, t - 1)]))
 
@@ -256,3 +278,4 @@ def save_cosine_curve_png(
 
 def sort_trace_points(points: Iterable[object]) -> list[object]:
     return sorted(list(points), key=lambda x: (_tau_of(x), _tag_of(x)))
+

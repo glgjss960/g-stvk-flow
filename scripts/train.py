@@ -96,6 +96,8 @@ def main() -> None:
         reg_grid_size=cfg.flow.reg_grid_size,
         integration_grid_size=getattr(cfg.flow, 'integration_grid_size', 129),
         rate_floor=getattr(cfg.flow, 'rate_floor', 1e-4),
+        lambda_replace_thr=getattr(cfg.flow, 'lambda_replace_thr', 0.55),
+        tail_start=getattr(cfg.flow, 'tail_start', 0.85),
     ).to(device)
     interpolant = STVKInterpolant(transform=transform, schedule=schedule)
 
@@ -131,4 +133,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

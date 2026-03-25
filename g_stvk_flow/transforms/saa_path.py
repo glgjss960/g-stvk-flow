@@ -47,6 +47,8 @@ class GeometricPathScheduler(nn.Module):
         reg_grid_size: int,
         integration_grid_size: int = 129,
         rate_floor: float = 1e-4,
+        lambda_replace_thr: float = 0.55,
+        tail_start: float = 0.85,
     ) -> None:
         super().__init__()
         if num_knots < 2:
@@ -65,6 +67,8 @@ class GeometricPathScheduler(nn.Module):
         self.reg_grid_size = int(reg_grid_size)
         self.integration_grid_size = max(17, int(integration_grid_size))
         self.rate_floor = float(rate_floor)
+        self.lambda_replace_thr = float(lambda_replace_thr)
+        self.tail_start = float(tail_start)
 
         # Monotone curves are parameterized by positive increments on knot segments.
         self.gamma_s_logits = nn.Parameter(torch.zeros(self.num_knots))
@@ -265,12 +269,22 @@ class GeometricPathScheduler(nn.Module):
 
         mono = F.relu(lam[:-1] - lam[1:]).square().mean()
 
+        tail_start = min(max(float(self.tail_start), 0.0), 1.0)
+        tail_mask = tau_grid >= tail_start
+        if bool(tail_mask.any()):
+            tail_quiet = lam_dot[tail_mask].square().mean()
+        else:
+            tail_quiet = torch.zeros((), device=ks.device, dtype=ks.dtype)
+        end_slope = lam_dot[-1].square().mean()
+
         return {
             "endpoint": endpoint,
             "coverage": coverage,
             "spread": spread,
             "smooth": smooth,
             "mono": mono,
+            "tail_quiet": tail_quiet,
+            "end_slope": end_slope,
         }
 
     def build_edit_weights(
@@ -285,14 +299,15 @@ class GeometricPathScheduler(nn.Module):
         path_softness: float,
     ) -> torch.Tensor:
         tau = torch.tensor([float(tau_anchor)], device=ks.device, dtype=ks.dtype)
-        _, _, state = self.lambda_and_derivative(tau=tau, ks=ks, kt=kt)
-
-        dist = state.distance[0]
-        radius = state.radius[0]
+        lam_anchor, _, _ = self.lambda_and_derivative(tau=tau, ks=ks, kt=kt)
+        lam_anchor = lam_anchor[0]
 
         kt_term = torch.sigmoid((kt - float(kt_threshold)) / max(float(kt_softness), 1e-4))
         ks_term = torch.sigmoid((ks - float(ks_min_replace)) / max(float(ks_softness), 1e-4))
-        path_term = torch.sigmoid((dist - radius) / max(float(path_softness), 1e-4))
+
+        # Replace bands that are still weakly activated at anchor under the current lambda path.
+        lambda_soft = max(float(path_softness), 1e-4)
+        path_term = torch.sigmoid((float(self.lambda_replace_thr) - lam_anchor) / lambda_soft)
 
         return (kt_term * ks_term * path_term).clamp(0.0, 1.0)
 

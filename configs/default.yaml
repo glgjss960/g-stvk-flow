@@ -36,6 +36,8 @@ flow:
   reg_grid_size: 21
   integration_grid_size: 129
   rate_floor: 0.0001
+  lambda_replace_thr: 0.55
+  tail_start: 0.85
 
 train:
   batch_size: 4
@@ -53,6 +55,8 @@ train:
   reg_smooth: 0.001
   reg_every: 1
   reg_mono: 0.05
+  reg_tail: 0.05
+  reg_end_slope: 0.02
 
 inference:
   steps: 60
@@ -61,3 +65,4 @@ inference:
   kt_softness: 0.08
   ks_softness: 0.08
   path_softness: 0.08
+
