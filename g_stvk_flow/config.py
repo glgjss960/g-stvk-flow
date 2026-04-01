@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -30,13 +30,26 @@ class TransformConfig:
 
 @dataclass
 class ModelConfig:
-    base_channels: int
-    channel_mults: List[int]
-    num_res_blocks: int
-    cond_dim: int
-    phase_dim: int
-    num_classes: int
-    dropout: float
+    # Legacy UNet knobs (still supported when backbone=unet3d).
+    base_channels: int = 96
+    channel_mults: List[int] = field(default_factory=lambda: [1, 2, 4])
+    num_res_blocks: int = 2
+
+    # Shared conditioning knobs.
+    cond_dim: int = 256
+    phase_dim: int = 11
+    num_classes: int = 0
+    dropout: float = 0.0
+
+    # Open-Sora-style DiT knobs (default backend).
+    backbone: str = "opensora_dit"
+    hidden_size: int = 512
+    depth: int = 8
+    num_heads: int = 8
+    mlp_ratio: float = 4.0
+    patch_size_t: int = 1
+    patch_size_h: int = 2
+    patch_size_w: int = 2
 
 
 @dataclass
@@ -119,14 +132,34 @@ def load_config(path: str | Path) -> Config:
     train_raw.setdefault("reg_tail", 0.0)
     train_raw.setdefault("reg_end_slope", 0.0)
 
+    model_raw = dict(raw.get("model", {}))
+    model_defaults = {
+        "base_channels": 96,
+        "channel_mults": [1, 2, 4],
+        "num_res_blocks": 2,
+        "cond_dim": 256,
+        "phase_dim": 11,
+        "num_classes": 0,
+        "dropout": 0.0,
+        "backbone": "opensora_dit",
+        "hidden_size": 512,
+        "depth": 8,
+        "num_heads": 8,
+        "mlp_ratio": 4.0,
+        "patch_size_t": 1,
+        "patch_size_h": 2,
+        "patch_size_w": 2,
+    }
+    for key, value in model_defaults.items():
+        model_raw.setdefault(key, value)
+
     return Config(
         seed=int(raw["seed"]),
         run=RunConfig(**raw["run"]),
         data=DataConfig(**raw["data"]),
         transform=TransformConfig(**raw["transform"]),
-        model=ModelConfig(**raw["model"]),
+        model=ModelConfig(**model_raw),
         flow=FlowConfig(**flow_raw),
         train=TrainConfig(**train_raw),
         inference=InferenceConfig(**raw["inference"]),
     )
-

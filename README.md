@@ -1,21 +1,23 @@
-﻿# G-STVK-Flow
+﻿# g-STVK-Flow
 
 Geometric Spatio-Temporal Variance-preserving K-Flow for conditional video generation.
 
-This implementation focuses on three core upgrades:
+This implementation is organized as a three-layer bridge, matching your requested engineering route:
 
-- Geometric band path: a learnable front on `(k_s, k_t)` with monotone motion.
-- Path regularization: endpoint, coverage, spread, and smoothness losses.
-- VP harmonic bridge with hard-boundary lambda: smooth monotone schedule with lambda(0)=0 and lambda(1)=1.
+- Open-Sora style backbone: video DiT-style transformer (`g_stvk_flow/models/opensora_dit.py`).
+- flow_matching style FM abstraction: `ProbPath`-like path sampling + `Solver`-like ODE sampling (`g_stvk_flow/fm/`).
+- g-STVK method layer: geometric scheduler + Haar-band bridge/interpolant (`g_stvk_flow/transforms/`).
 
 ## Project layout
 
-- `g_stvk_flow/`: library package.
+- `g_stvk_flow/transforms/`: g-STVK scheduler/interpolant and Haar3D band ops.
+- `g_stvk_flow/fm/`: flow_matching-style path/sampler bridge.
+- `g_stvk_flow/models/`: velocity model (`STVKFlowModel`) with Open-Sora style DiT default.
+- `g_stvk_flow/engine/`: training and inference pipeline.
 - `scripts/preprocess_videos.py`: raw video -> cached clip tensors.
 - `scripts/train.py`: training.
-- `scripts/infer.py`: standard sampling.
-- `scripts/infer_disentangled.py`: content-motion disentangled sampling.
-- `configs/default.yaml`: default configuration.
+- `scripts/infer.py`: standard generation.
+- `scripts/infer_disentangled.py`: two-stage anchor disentangled generation.
 
 ## Environment
 
@@ -24,7 +26,11 @@ cd g-stvk-flow
 pip install -r requirements.txt
 ```
 
-## 1) Data preprocessing
+Notes:
+- `torchdiffeq` is optional. If available, non-Heun sampler methods can use official `flow_matching` ODE solver backend.
+- Default `heun` sampling always works through local explicit solver implementation.
+
+## Data preprocessing
 
 Expected raw directory format:
 
@@ -56,35 +62,33 @@ Outputs:
 - `class_to_idx.json`
 - `stats.json`
 
-## 2) Configure training
+## Configure training
 
 Edit `configs/default.yaml`:
 
-- `data.manifest_train` / `data.manifest_val`: point to your manifests.
-- `model.num_classes`: set to your class count (for UCF101 use `101`).
-- `run.output_dir`: training output directory.
+- `data.manifest_train` / `data.manifest_val`: training/validation manifests.
+- `model.backbone`: `opensora_dit` (default) or `unet3d`.
+- `model.num_classes`: class count (for UCF101 set to `101`).
+- `run.output_dir`: output directory.
 
-## 3) Train
+## Train
 
 ```bash
 python scripts/train.py --config configs/default.yaml
 ```
 
-Checkpoints are saved to:
+Checkpoints:
 
 - `runs/g_stvk_flow/checkpoints/last.pt`
 - `runs/g_stvk_flow/checkpoints/epoch_xxxx.pt`
 
-Notes:
-
-- Checkpoint includes both `model` and `schedule` state.
-- Resume training:
+Resume:
 
 ```bash
 python scripts/train.py --config configs/default.yaml --resume /path/to/last.pt
 ```
 
-## 4) Standard inference
+## Standard inference
 
 ```bash
 python scripts/infer.py \
@@ -97,7 +101,7 @@ python scripts/infer.py \
   --seed 123
 ```
 
-## 5) Disentangled inference
+## Disentangled inference
 
 ```bash
 python scripts/infer_disentangled.py \
@@ -135,141 +139,14 @@ Reference file format:
 - `train.reg_endpoint/reg_coverage/reg_spread/reg_smooth: 0.05/0.02/0.02/0.001`
 - disentangled inference: `anchor=0.35`, `kt-threshold=0.55`, `ks-min-replace=0.15`
 
-## 6) Evaluation checklist (directly runnable)
+## Evaluation scripts
 
-### 6.1 Checkpoint gate for standard inference
+Provided scripts:
 
-```bash
-python scripts/eval_checkpoint_gate.py \
-  --checkpoint /path/to/runs/g_stvk_flow/checkpoints/epoch_0048.pt \
-  --config configs/default.yaml \
-  --class-label 0 \
-  --num-samples 16 \
-  --steps 120 \
-  --solver heun \
-  --out-json outputs/eval_gate_epoch_0048.json
-```
+- `scripts/eval_checkpoint_gate.py`
+- `scripts/eval_disentangle_intrinsic.py`
+- `scripts/eval_disentangle_semantic.py`
+- `scripts/eval_disentangle_bidirectional.py`
+- `scripts/diagnose_transport.py`
 
-Output JSON fields:
-
-- `summary.val_fm_loss`
-- `summary.video_std_mean`
-- `summary.spatial_corr_mean`
-- `summary.temporal_corr_mean`
-- `summary.temporal_diff_mean`
-- `gate.passed` and `gate.rules`
-
-### 6.2 Intrinsic disentanglement evaluation
-
-```bash
-python scripts/eval_disentangle_intrinsic.py \
-  --checkpoint /path/to/runs/g_stvk_flow/checkpoints/epoch_0048.pt \
-  --config configs/default.yaml \
-  --content-labels 0,1 \
-  --motion-labels 2,3,4 \
-  --num-seeds 6 \
-  --steps 120 \
-  --solver heun \
-  --anchor 0.35 \
-  --kt-threshold 0.55 \
-  --ks-min-replace 0.15 \
-  --out-json outputs/eval_disentangle_intrinsic_epoch_0048.json
-```
-
-Output JSON fields:
-
-- `summary.low_band_cos_mean`
-- `summary.high_band_cos_mean`
-- `summary.motion_energy_gap_mean`
-- `summary.pass_rate_mean`
-- per-pair breakdown in `pairs[]`
-
-### 6.3 Semantic motion controllability (requires external classifier)
-
-```bash
-python scripts/eval_disentangle_semantic.py \
-  --checkpoint /path/to/runs/g_stvk_flow/checkpoints/epoch_0048.pt \
-  --config configs/default.yaml \
-  --motion-clf-ts /path/to/ucf101_motion_classifier.ts \
-  --content-labels 0,1 \
-  --motion-labels 2,3,4 \
-  --num-seeds 8 \
-  --steps 120 \
-  --solver heun \
-  --out-json outputs/eval_disentangle_semantic_epoch_0048.json
-```
-
-Output JSON fields:
-
-- `summary.macro_motion_acc`
-- `summary.micro_motion_acc`
-- per-case breakdown in `by_case[]`
-
-### 6.4 Bidirectional disentanglement (K-Flow style migration)
-
-```bash
-python scripts/eval_disentangle_bidirectional.py \
-  --checkpoint /path/to/runs/g_stvk_flow/checkpoints/epoch_0048.pt \
-  --config configs/default.yaml \
-  --content-labels 0,1,2 \
-  --motion-labels 3,4,5 \
-  --num-seeds 6 \
-  --steps 120 \
-  --solver heun \
-  --anchor 0.35 \
-  --kt-threshold 0.55 \
-  --ks-min-replace 0.15 \
-  --out-json outputs/eval_disentangle_bidirectional_epoch_0048.json
-```
-
-Output JSON fields:
-
-- `direction_A_low_preserve_high_change.summary.*`
-- `direction_B_high_preserve_low_change.summary.*`
-- per-pair breakdown in each `pairs[]`
-
-## 7) Trajectory diagnostics (every ~10% tau + anchor densification)
-
-Standard inference with trajectory export:
-
-```bash
-python scripts/infer.py \
-  --checkpoint /path/to/runs/g_stvk_flow/checkpoints/last.pt \
-  --config configs/default.yaml \
-  --out /path/to/outputs/sample.mp4 \
-  --steps 120 \
-  --solver heun \
-  --class-label 0 \
-  --seed 123 \
-  --trace-dir /path/to/outputs/trace_standard \
-  --trace-percent 10
-```
-
-Disentangled inference with anchor-focused trajectory export:
-
-```bash
-python scripts/infer_disentangled.py \
-  --checkpoint /path/to/runs/g_stvk_flow/checkpoints/last.pt \
-  --config configs/default.yaml \
-  --out /path/to/outputs/disentangled.mp4 \
-  --steps 120 \
-  --solver heun \
-  --content-label 0 \
-  --motion-label 10 \
-  --anchor 0.35 \
-  --kt-threshold 0.55 \
-  --ks-min-replace 0.15 \
-  --seed 123 \
-  --trace-dir /path/to/outputs/trace_disentangled \
-  --trace-percent 10 \
-  --trace-dense-window 0.05
-```
-
-Trace outputs:
-
-- `trace_summary.json`: tau list, cosine values, saved file paths.
-- `videos/*.mp4`: one video per traced tau.
-- `mid_frames/*.png`: quick middle-frame preview for each tau.
-- `cos_curve_*.png`: low/high band cosine curves.
-- disentangled only: `anchor_pre_post_compare.png`.
-
+Use `--help` on each script for complete arguments.

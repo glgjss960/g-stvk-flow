@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from g_stvk_flow.config import Config
+from g_stvk_flow.fm import GSTVKProbPath
 from g_stvk_flow.transforms import GSTVKInterpolant
 from g_stvk_flow.utils import save_checkpoint
 
@@ -23,22 +24,24 @@ def _evaluate(
 ) -> float:
     model.eval()
     losses = []
+    path = GSTVKProbPath(interpolant)
+
     with torch.no_grad():
         for batch in loader:
-            x = batch["video"].to(device)
+            x_1 = batch["video"].to(device)
             labels = batch["label"].to(device)
-            tau = torch.rand(x.size(0), device=device)
-            eps = torch.randn_like(x)
+            t = torch.rand(x_1.size(0), device=device)
+            x_0 = torch.randn_like(x_1)
 
-            sample = interpolant.build(x_data=x, eps=eps, tau=tau)
+            sample = path.sample(x_0=x_0, x_1=x_1, t=t)
             with autocast(enabled=use_amp):
                 pred = model(
-                    sample.psi_tau,
-                    tau=tau,
+                    sample.x_t,
+                    tau=t,
                     class_labels=labels,
                     phase_features=sample.phase_features,
                 )
-                loss = F.mse_loss(pred, sample.v_target)
+                loss = F.mse_loss(pred, sample.dx_t)
             losses.append(float(loss.item()))
 
     model.train()
@@ -88,6 +91,7 @@ def train_loop(
 
     scaler = GradScaler(enabled=cfg.train.amp and device.type == "cuda")
     global_step = 0
+    path = GSTVKProbPath(interpolant)
 
     for epoch in range(start_epoch, cfg.train.epochs):
         pbar = tqdm(train_loader, desc=f"epoch {epoch}", leave=False)
@@ -95,22 +99,22 @@ def train_loop(
         running_total = 0.0
 
         for batch in pbar:
-            x = batch["video"].to(device)
+            x_1 = batch["video"].to(device)
             labels = batch["label"].to(device)
 
-            tau = torch.rand(x.size(0), device=device)
-            eps = torch.randn_like(x)
-            sample = interpolant.build(x_data=x, eps=eps, tau=tau)
+            t = torch.rand(x_1.size(0), device=device)
+            x_0 = torch.randn_like(x_1)
+            sample = path.sample(x_0=x_0, x_1=x_1, t=t)
 
             optimizer.zero_grad(set_to_none=True)
             with autocast(enabled=cfg.train.amp and device.type == "cuda"):
                 pred = model(
-                    sample.psi_tau,
-                    tau=tau,
+                    sample.x_t,
+                    tau=t,
                     class_labels=labels,
                     phase_features=sample.phase_features,
                 )
-                fm_loss = F.mse_loss(pred, sample.v_target)
+                fm_loss = F.mse_loss(pred, sample.dx_t)
 
             reg_loss = torch.zeros((), device=device)
             reg_metrics: dict[str, float] = {}
@@ -170,4 +174,3 @@ def train_loop(
             }
             save_checkpoint(state, ckpt_dir / "last.pt")
             save_checkpoint(state, ckpt_dir / f"epoch_{epoch + 1:04d}.pt")
-

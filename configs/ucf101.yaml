@@ -15,13 +15,23 @@ transform:
   levels: 2
 
 model:
-  base_channels: 96
-  channel_mults: [1, 2, 4]
-  num_res_blocks: 2
+  backbone: opensora_dit
+  hidden_size: 512
+  depth: 8
+  num_heads: 8
+  mlp_ratio: 4.0
+  patch_size_t: 1
+  patch_size_h: 2
+  patch_size_w: 2
+
   cond_dim: 256
   phase_dim: 11
   num_classes: 101
   dropout: 0.0
+
+  base_channels: 96
+  channel_mults: [1, 2, 4]
+  num_res_blocks: 2
 
 flow:
   num_knots: 8
@@ -65,4 +75,3 @@ inference:
   kt_softness: 0.08
   ks_softness: 0.08
   path_softness: 0.08
-

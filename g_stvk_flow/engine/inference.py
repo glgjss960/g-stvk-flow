@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from g_stvk_flow.fm import GSTVKSolver, GSTVKVelocityWrapper
 from g_stvk_flow.transforms import BandMeta, Haar3DTransform, SAASchedule
 
 
@@ -63,39 +64,45 @@ def _integrate(
     if steps <= 0:
         return psi, []
 
-    taus = torch.linspace(tau_start, tau_end, steps + 1, device=psi.device)
-    ks = band_meta.ks.to(psi.device)
-    kt = band_meta.kt.to(psi.device)
-
+    time_grid = torch.linspace(tau_start, tau_end, steps + 1, device=psi.device, dtype=psi.dtype)
     capture_map = _capture_index_map(tau_start=tau_start, tau_end=tau_end, steps=steps, trace_taus=trace_taus)
-    traces: list[TracePoint] = []
 
-    if 0 in capture_map:
-        traces.append(TracePoint(tau=float(taus[0].item()), tag=trace_tag, video=psi.detach().clone()))
+    velocity = GSTVKVelocityWrapper(
+        model=model,
+        schedule=schedule,
+        ks=band_meta.ks.to(device=psi.device, dtype=psi.dtype),
+        kt=band_meta.kt.to(device=psi.device, dtype=psi.dtype),
+    )
+    sampler = GSTVKSolver(velocity_model=velocity)
 
-    for i in range(steps):
-        t0 = taus[i]
-        t1 = taus[i + 1]
-        dt = t1 - t0
+    if capture_map:
+        traj = sampler.sample(
+            x_init=psi,
+            time_grid=time_grid,
+            method=solver,
+            return_intermediates=True,
+            class_labels=class_labels,
+        )
 
-        tau_vec0 = torch.full((psi.shape[0],), float(t0.item()), device=psi.device)
-        phase0 = schedule.phase_features_from_tau(tau=tau_vec0, ks=ks, kt=kt)
-        v0 = model(psi, tau=tau_vec0, class_labels=class_labels, phase_features=phase0)
+        traces: list[TracePoint] = []
+        for idx in sorted(capture_map.keys()):
+            traces.append(
+                TracePoint(
+                    tau=float(time_grid[idx].item()),
+                    tag=trace_tag,
+                    video=traj[idx].detach().clone(),
+                )
+            )
+        return traj[-1], traces
 
-        if solver.lower() == "heun":
-            psi_pred = psi + dt * v0
-            tau_vec1 = torch.full((psi.shape[0],), float(t1.item()), device=psi.device)
-            phase1 = schedule.phase_features_from_tau(tau=tau_vec1, ks=ks, kt=kt)
-            v1 = model(psi_pred, tau=tau_vec1, class_labels=class_labels, phase_features=phase1)
-            psi = psi + 0.5 * dt * (v0 + v1)
-        else:
-            psi = psi + dt * v0
-
-        next_idx = i + 1
-        if next_idx in capture_map:
-            traces.append(TracePoint(tau=float(t1.item()), tag=trace_tag, video=psi.detach().clone()))
-
-    return psi, traces
+    out = sampler.sample(
+        x_init=psi,
+        time_grid=time_grid,
+        method=solver,
+        return_intermediates=False,
+        class_labels=class_labels,
+    )
+    return out, []
 
 
 @torch.no_grad()

@@ -80,6 +80,14 @@ def main() -> None:
         phase_dim=cfg.model.phase_dim,
         num_classes=cfg.model.num_classes,
         dropout=cfg.model.dropout,
+        backbone=getattr(cfg.model, 'backbone', 'opensora_dit'),
+        hidden_size=getattr(cfg.model, 'hidden_size', 512),
+        depth=getattr(cfg.model, 'depth', 8),
+        num_heads=getattr(cfg.model, 'num_heads', 8),
+        mlp_ratio=getattr(cfg.model, 'mlp_ratio', 4.0),
+        patch_size_t=getattr(cfg.model, 'patch_size_t', 1),
+        patch_size_h=getattr(cfg.model, 'patch_size_h', 2),
+        patch_size_w=getattr(cfg.model, 'patch_size_w', 2),
     ).to(device)
 
     transform = Haar3DTransform(levels=cfg.transform.levels)
@@ -133,5 +141,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
