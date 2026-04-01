@@ -1,4 +1,3 @@
-﻿from .opensora_dit import OpenSoraStyleDiTBackbone
-from .stvk_model import STVKFlowModel
+﻿from g_stvk_flow.backbone import OpenSoraStyleDiTBackbone, STVKFlowModel
 
 __all__ = ["OpenSoraStyleDiTBackbone", "STVKFlowModel"]

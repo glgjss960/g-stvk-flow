@@ -1,5 +1,4 @@
-﻿from .path import GSTVKPathSample, GSTVKProbPath
-from .solver import GSTVKSolver, GSTVKVelocityWrapper
+﻿from g_stvk_flow.fm_core import GSTVKPathSample, GSTVKProbPath, GSTVKSolver, GSTVKVelocityWrapper
 
 __all__ = [
     "GSTVKPathSample",
