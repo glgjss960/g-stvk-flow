@@ -5,6 +5,7 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 
 def _modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -110,6 +111,7 @@ class OpenSoraStyleDiTBackbone(nn.Module):
         mlp_ratio: float = 4.0,
         patch_size: Tuple[int, int, int] = (1, 2, 2),
         dropout: float = 0.0,
+        grad_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         if len(patch_size) != 3:
@@ -123,6 +125,7 @@ class OpenSoraStyleDiTBackbone(nn.Module):
         self.out_channels = int(out_channels)
         self.hidden_size = int(hidden_size)
         self.patch_size = (pt, ph, pw)
+        self.grad_checkpoint = bool(grad_checkpoint)
 
         self.patch_embed = nn.Conv3d(
             in_channels=self.in_channels,
@@ -211,8 +214,15 @@ class OpenSoraStyleDiTBackbone(nn.Module):
         tokens = self._add_positional_embeddings(tokens=tokens, tp=tp, hp=hp, wp=wp)
 
         for block in self.blocks:
-            tokens = block(tokens, cond)
+            if self.grad_checkpoint and self.training:
+                try:
+                    tokens = torch_checkpoint(block, tokens, cond, use_reentrant=False)
+                except TypeError:
+                    tokens = torch_checkpoint(block, tokens, cond)
+            else:
+                tokens = block(tokens, cond)
 
         tokens = self.final(tokens, cond)
         out = self._unpatchify(tokens=tokens, tp=tp, hp=hp, wp=wp)
         return out
+

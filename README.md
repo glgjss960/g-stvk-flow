@@ -96,3 +96,45 @@ python scripts/infer_disentangled.py \
 - `scripts/diagnose_transport.py`
 
 Use `--help` for full arguments.
+
+## Phase-A (MVP) implementation
+
+This branch now includes a dedicated phase-A pipeline that matches `phaseA.pdf`:
+
+- latent pipeline through `VideoVAEWrapper` (supports `identity` and `opensora_hunyuan` backends)
+- separable Haar decomposition: `2D spatial + 1D temporal`
+- fixed hand-crafted path (`Path A` / `Path B`)
+- lightweight band-aware conditioning (`band_id` embedding only)
+- flow-matching based affine path noise construction (from local `flow_matching/`)
+
+### Train phase-A
+
+```bash
+python scripts/train_stageA.py --config configs/train_stageA.yaml
+```
+
+### Train vanilla baseline
+
+```bash
+python scripts/train_stageA.py --config configs/baseline_vanilla.yaml
+```
+
+### Sample / eval
+
+```bash
+python scripts/eval_stageA.py \
+  --checkpoint /path/to/checkpoints/last.pt \
+  --config configs/train_stageA.yaml \
+  --out /path/to/output/sample.mp4
+```
+
+### Band ablation
+
+```bash
+python scripts/ablate_band.py \
+  --checkpoint /path/to/checkpoints/last.pt \
+  --config configs/train_stageA.yaml \
+  --out /path/to/output/ablate_hs_ht.mp4 \
+  --band hs_ht \
+  --scale 1.0
+```

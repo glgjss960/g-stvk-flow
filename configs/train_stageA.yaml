@@ -1,0 +1,62 @@
+﻿seed: 42
+
+run:
+  output_dir: ../runs/stageA_bandwise
+
+data:
+  manifest_train: ../data_cache/train_manifest.jsonl
+  manifest_val: ../data_cache/val_manifest.jsonl
+  in_channels: 3
+  frames: 16
+  image_size: 128
+
+vae:
+  backend: identity
+  open_sora_root: ../../Open-Sora
+  pretrained_path:
+  dtype: float32
+  freeze: true
+  sample_posterior: false
+
+decomposition:
+  mode: spatial_temporal
+
+path:
+  name: A
+
+model:
+  cond_dim: 256
+  hidden_size: 512
+  depth: 8
+  num_heads: 8
+  mlp_ratio: 4.0
+  patch_size_t: 1
+  patch_size_h: 2
+  patch_size_w: 2
+  num_classes: 0
+  dropout: 0.0
+  use_band_embed: true
+
+training:
+  mode: bandwise
+  batch_size: 4
+  num_workers: 2
+  epochs: 100
+  lr: 1.0e-4
+  weight_decay: 0.01
+  grad_clip: 1.0
+  amp: true
+  log_every: 20
+  save_every: 1
+  target_type: epsilon
+  scheduler: cosine
+  flow_matching_root: ../../flow_matching
+  band_weights:
+    ls_lt: 1.0
+    ls_ht: 1.0
+    hs_lt: 1.0
+    hs_ht: 1.0
+
+sampling:
+  steps_per_band: 24
+  fps: 8

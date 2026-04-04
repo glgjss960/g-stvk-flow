@@ -1,0 +1,100 @@
+﻿seed: 42
+
+run:
+  output_dir: ../runs/stageA_bandwise_1p15b_ucf101_320x240_25fps_f120
+
+# Optional: this section is used by scripts/preprocess_videos.py --config <this_file>
+preprocess:
+  raw_dir: ../datasets/ucf101/raw
+  out_dir: ../data_cache_ucf101_320x240_25fps_f120
+  frames: 120
+  stride: 120
+  image_height: 240
+  image_width: 320
+  image_size: 240
+  fps: 25
+  train_ratio: 0.9
+  tail_pad_last_window: true
+
+data:
+  manifest_train: ../data_cache_ucf101_320x240_25fps_f120/train_manifest.jsonl
+  manifest_val: ../data_cache_ucf101_320x240_25fps_f120/val_manifest.jsonl
+  # For opensora_hunyuan backend, this must match latent z_channels.
+  in_channels: 16
+  # Raw-clip settings aligned with UCF requirement.
+  frames: 120
+  image_height: 240
+  image_width: 320
+  image_size: 240
+  fps: 25
+
+vae:
+  backend: opensora_hunyuan
+  open_sora_root: ../../Open-Sora
+  # Update this path to your local checkpoint location if needed.
+  pretrained_path: ../../Open-Sora/ckpts/hunyuan_vae.safetensors
+  dtype: bfloat16
+  freeze: true
+  sample_posterior: false
+
+decomposition:
+  mode: spatial_temporal
+
+path:
+  name: A
+
+model:
+  cond_dim: 256
+  hidden_size: 1408
+  depth: 33
+  num_heads: 16
+  mlp_ratio: 4.0
+  patch_size_t: 1
+  patch_size_h: 2
+  patch_size_w: 2
+  num_classes: 0
+  dropout: 0.0
+  use_band_embed: true
+  grad_checkpoint: true
+
+training:
+  mode: bandwise
+  batch_size: 1
+  grad_accum_steps: 4
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+  shuffle_train: true
+  shuffle_val: false
+  drop_last_train: true
+  drop_last_val: false
+
+  epochs: 100
+  lr: 5.0e-5
+  weight_decay: 0.01
+  grad_clip: 1.0
+  amp: true
+  log_every: 10
+  save_every: 1
+
+  target_type: epsilon
+  scheduler: cosine
+  flow_matching_root: ../../flow_matching
+  band_weights:
+    ls_lt: 1.0
+    ls_ht: 1.0
+    hs_lt: 1.0
+    hs_ht: 1.0
+
+sampling:
+  # Used by eval_stageA.py if CLI doesn't override
+  checkpoint: ../runs/stageA_bandwise_1p15b_ucf101_320x240_25fps_f120/checkpoints/last.pt
+  out: ../runs/stageA_bandwise_1p15b_ucf101_320x240_25fps_f120/samples/sample.mp4
+  steps_per_band: 32
+  fps: 25
+  seed: 42
+  class_label:
+  ablate_band:
+  ablate_scale: 1.0
+  save_scale: 1.0
