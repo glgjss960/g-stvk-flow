@@ -1,12 +1,14 @@
 ﻿from __future__ import annotations
 
 import argparse
+import json
 import random
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
@@ -17,7 +19,8 @@ from g_stvk_flow.kflow import FixedBandPath, SeparableHaarVideoDecomposer
 from g_stvk_flow.losses import BandwiseDiffusionObjective, VanillaDiffusionObjective
 from g_stvk_flow.models.stdit_band import StageABandVideoModel
 from g_stvk_flow.models.vae_wrapper import VideoVAEWrapper
-from g_stvk_flow.utils import load_checkpoint, save_checkpoint
+from g_stvk_flow.samplers import StageABandSampler
+from g_stvk_flow.utils import load_checkpoint, save_checkpoint, save_video_tensor
 
 
 def _set_seed(seed: int) -> None:
@@ -117,6 +120,12 @@ def _build_loader(
     return DataLoader(**kwargs)
 
 
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+
+
 def _run_eval(
     model: StageABandVideoModel,
     vae: VideoVAEWrapper,
@@ -126,14 +135,22 @@ def _run_eval(
     fixed_path: FixedBandPath,
     band_objective: BandwiseDiffusionObjective,
     vanilla_objective: VanillaDiffusionObjective,
+    decomposer: SeparableHaarVideoDecomposer,
     amp_enabled: bool,
     raw_frames: int,
     raw_h: int,
     raw_w: int,
     in_channels: int,
-) -> float:
+    eval_full_bandwise: bool,
+    eval_track_band_losses: bool,
+) -> tuple[float, dict[str, float]]:
     model.eval()
-    losses = []
+
+    overall_sum = 0.0
+    overall_count = 0
+    band_names = list(fixed_path.order)
+    band_sum = {name: 0.0 for name in band_names}
+    band_count = {name: 0 for name in band_names}
 
     with torch.no_grad():
         for batch in loader:
@@ -158,12 +175,20 @@ def _run_eval(
             t = torch.rand(z.shape[0], device=device, dtype=z.dtype)
 
             if train_mode == "bandwise":
-                band_name = random.choice(list(fixed_path.order))
-                state = band_objective.build_state(clean_latent=z, t=t, band_name=band_name)
-                band_id = torch.full((z.shape[0],), fixed_path.index_of(band_name), dtype=torch.long, device=device)
-                with autocast(enabled=amp_enabled):
-                    pred = model(x=state.x_t, t=t, band_id=band_id, class_labels=labels)
-                    loss = band_objective.compute_loss(pred, state)
+                eval_bands = band_names if eval_full_bandwise else [random.choice(band_names)]
+                for band_name in eval_bands:
+                    state = band_objective.build_state(clean_latent=z, t=t, band_name=band_name)
+                    band_id = torch.full((z.shape[0],), fixed_path.index_of(band_name), dtype=torch.long, device=device)
+                    with autocast(enabled=amp_enabled):
+                        pred = model(x=state.x_t, t=t, band_id=band_id, class_labels=labels)
+                        loss = band_objective.compute_loss(pred, state)
+
+                    v = float(loss.item())
+                    overall_sum += v
+                    overall_count += 1
+                    if eval_track_band_losses:
+                        band_sum[band_name] += v
+                        band_count[band_name] += 1
             else:
                 x_t, target = vanilla_objective.build_state(clean_latent=z, t=t)
                 band_id = torch.zeros((z.shape[0],), dtype=torch.long, device=device)
@@ -171,10 +196,127 @@ def _run_eval(
                     pred = model(x=x_t, t=t, band_id=band_id, class_labels=labels)
                     loss = vanilla_objective.compute_loss(pred, target)
 
-            losses.append(float(loss.item()))
+                v = float(loss.item())
+                overall_sum += v
+                overall_count += 1
+
+                if eval_track_band_losses:
+                    pred_bands = decomposer.forward(pred)
+                    tgt_bands = decomposer.forward(target)
+                    for band_name in band_names:
+                        bv = float(F.mse_loss(pred_bands[band_name], tgt_bands[band_name]).item())
+                        band_sum[band_name] += bv
+                        band_count[band_name] += 1
 
     model.train()
-    return sum(losses) / max(len(losses), 1)
+    overall = overall_sum / max(overall_count, 1)
+    band_avg = {
+        name: (band_sum[name] / max(band_count[name], 1)) if band_count[name] > 0 else float("nan")
+        for name in band_names
+    }
+    return overall, band_avg
+
+
+def _run_monitor_samples(
+    *,
+    model: StageABandVideoModel,
+    vae: VideoVAEWrapper,
+    decomposer: SeparableHaarVideoDecomposer,
+    fixed_path: FixedBandPath,
+    cfg_root: Path,
+    cfg: dict[str, Any],
+    data_cfg: dict[str, Any],
+    train_cfg: dict[str, Any],
+    monitor_cfg: dict[str, Any],
+    run_dir: Path,
+    epoch: int,
+    device: torch.device,
+) -> dict[str, Any]:
+    if not bool(monitor_cfg.get("enabled", False)):
+        return {}
+
+    every_epochs = max(1, int(monitor_cfg.get("every_epochs", 1)))
+    if (epoch + 1) % every_epochs != 0:
+        return {}
+
+    out_dir = _resolve(cfg_root, monitor_cfg.get("output_dir"))
+    if out_dir is None:
+        out_dir = run_dir / "monitor_samples"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    flow_root = _resolve(cfg_root, train_cfg.get("flow_matching_root"))
+    sampler = StageABandSampler(
+        model=model,
+        decomposer=decomposer,
+        fixed_path=fixed_path,
+        target_type=str(train_cfg.get("target_type", "epsilon")),
+        scheduler_name=str(train_cfg.get("scheduler", "cosine")),
+        flow_matching_root=flow_root,
+    )
+
+    steps_per_band = int(monitor_cfg.get("steps_per_band", cfg.get("sampling", {}).get("steps_per_band", 24)))
+    fps = int(monitor_cfg.get("fps", cfg.get("sampling", {}).get("fps", data_cfg.get("fps", 8))))
+    save_scale = float(monitor_cfg.get("save_scale", cfg.get("sampling", {}).get("save_scale", 1.0)))
+
+    num_samples = max(1, int(monitor_cfg.get("num_samples", 1)))
+    base_seed = int(monitor_cfg.get("seed", 42))
+    class_label = monitor_cfg.get("class_label", None)
+    labels = None
+    if class_label is not None:
+        labels = torch.full((1,), int(class_label), dtype=torch.long, device=device)
+
+    raw_frames = int(data_cfg["frames"])
+    raw_h, raw_w = _get_data_hw(data_cfg)
+    latent_t, latent_h, latent_w = vae.get_latent_size(raw_frames, raw_h, raw_w)
+    shape = (1, int(data_cfg["in_channels"]), int(latent_t), int(latent_h), int(latent_w))
+
+    ablate_bands = monitor_cfg.get("ablate_bands", list(fixed_path.order))
+    if not isinstance(ablate_bands, list):
+        ablate_bands = list(fixed_path.order)
+    ablate_scale = float(monitor_cfg.get("ablate_scale", 1.0))
+
+    model_was_training = model.training
+    model.eval()
+
+    saved = []
+    with torch.no_grad():
+        for i in range(num_samples):
+            seed = int(base_seed + i)
+            latent = sampler.sample(
+                shape=shape,
+                steps_per_band=steps_per_band,
+                device=device,
+                class_labels=labels,
+                seed=seed,
+            )
+            base_video = vae.decode(latent)
+
+            base_path = out_dir / f"epoch_{epoch + 1:04d}_seed_{seed:06d}_base.mp4"
+            save_video_tensor(base_video[0], base_path, fps=fps, scale=save_scale)
+            saved.append(str(base_path.as_posix()))
+
+            base_bands = decomposer.forward(latent)
+            for band_name in ablate_bands:
+                if band_name not in base_bands:
+                    continue
+                bands = {k: v.clone() for k, v in base_bands.items()}
+                bands[band_name] = bands[band_name] + ablate_scale * torch.randn_like(bands[band_name])
+                latent_ab = decomposer.inverse(bands)
+                video_ab = vae.decode(latent_ab)
+
+                ab_path = out_dir / f"epoch_{epoch + 1:04d}_seed_{seed:06d}_ablate_{band_name}.mp4"
+                save_video_tensor(video_ab[0], ab_path, fps=fps, scale=save_scale)
+                saved.append(str(ab_path.as_posix()))
+
+    if model_was_training:
+        model.train()
+
+    return {
+        "monitor_output_dir": str(out_dir.as_posix()),
+        "monitor_saved_count": len(saved),
+        "monitor_steps_per_band": steps_per_band,
+        "monitor_num_samples": num_samples,
+    }
 
 
 def main() -> None:
@@ -195,9 +337,11 @@ def main() -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir = run_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = run_dir / "metrics.jsonl"
 
     data_cfg = cfg["data"]
     train_cfg = cfg["training"]
+    monitor_cfg = cfg.get("monitor", {})
 
     train_manifest = _resolve(cfg_root, data_cfg["manifest_train"])
     val_manifest = _resolve(cfg_root, data_cfg.get("manifest_val"))
@@ -323,10 +467,16 @@ def main() -> None:
     grad_clip = float(train_cfg.get("grad_clip", 1.0))
     grad_accum_steps = max(1, int(train_cfg.get("grad_accum_steps", 1)))
 
+    eval_full_bandwise = bool(train_cfg.get("eval_full_bandwise", True))
+    eval_track_band_losses = bool(train_cfg.get("eval_track_band_losses", True))
+
     for epoch in range(start_epoch, epochs):
         pbar = tqdm(train_loader, desc=f"stageA epoch {epoch}", leave=False)
         running = 0.0
         optimizer.zero_grad(set_to_none=True)
+
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
 
         for batch_idx, batch in enumerate(pbar):
             video = batch["video"].to(device)
@@ -378,14 +528,21 @@ def main() -> None:
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-                running += float(loss.item())
+                lv = float(loss.item())
+                running += lv
+                epoch_loss_sum += lv
+                epoch_loss_count += 1
+
                 if global_step % log_every == 0:
                     pbar.set_postfix({"loss": f"{running / log_every:.6f}", "mode": train_mode})
                     running = 0.0
 
+        train_loss_epoch = epoch_loss_sum / max(epoch_loss_count, 1)
+
         val_loss = None
+        val_band_loss: dict[str, float] = {}
         if val_loader is not None:
-            val_loss = _run_eval(
+            val_loss, val_band_loss = _run_eval(
                 model=model,
                 vae=vae,
                 loader=val_loader,
@@ -394,14 +551,21 @@ def main() -> None:
                 fixed_path=fixed_path,
                 band_objective=band_objective,
                 vanilla_objective=vanilla_objective,
+                decomposer=decomposer,
                 amp_enabled=amp_enabled,
                 raw_frames=raw_frames,
                 raw_h=raw_h,
                 raw_w=raw_w,
                 in_channels=in_channels,
+                eval_full_bandwise=eval_full_bandwise,
+                eval_track_band_losses=eval_track_band_losses,
             )
             print(f"[epoch {epoch}] val_loss={val_loss:.6f}")
+            if val_band_loss:
+                band_msg = " ".join([f"{k}={v:.6f}" for k, v in val_band_loss.items()])
+                print(f"[epoch {epoch}] val_band_loss {band_msg}")
 
+        monitor_metrics: dict[str, Any] = {}
         if (epoch + 1) % save_every == 0:
             state = {
                 "epoch": epoch + 1,
@@ -410,9 +574,39 @@ def main() -> None:
                 "optimizer": optimizer.state_dict(),
                 "config": cfg,
                 "val_loss": val_loss,
+                "val_band_loss": val_band_loss,
             }
             save_checkpoint(state, ckpt_dir / "last.pt")
             save_checkpoint(state, ckpt_dir / f"epoch_{epoch + 1:04d}.pt")
+
+            monitor_metrics = _run_monitor_samples(
+                model=model,
+                vae=vae,
+                decomposer=decomposer,
+                fixed_path=fixed_path,
+                cfg_root=cfg_root,
+                cfg=cfg,
+                data_cfg=data_cfg,
+                train_cfg=train_cfg,
+                monitor_cfg=monitor_cfg,
+                run_dir=run_dir,
+                epoch=epoch,
+                device=device,
+            )
+
+        record: dict[str, Any] = {
+            "epoch": epoch + 1,
+            "global_step": global_step,
+            "mode": train_mode,
+            "train_loss": train_loss_epoch,
+            "val_loss": val_loss,
+            "path_name": str(cfg.get("path", {}).get("name", "A")),
+            "target_type": str(train_cfg.get("target_type", "epsilon")),
+        }
+        for k, v in val_band_loss.items():
+            record[f"val_band_{k}"] = float(v)
+        record.update(monitor_metrics)
+        _append_jsonl(metrics_path, record)
 
 
 if __name__ == "__main__":
