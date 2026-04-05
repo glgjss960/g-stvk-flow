@@ -1,7 +1,7 @@
 ﻿seed: 42
 
 run:
-  output_dir: /home/jzx/K-Flow/runs/stageA_bandwise_1p15b_ucf101_320x240_25fps_f120
+  output_dir: /home/jzx/K-Flow/runs/stageA_vanilla_1p15b_ucf101_320x240_25fps_f120
 
 # Optional: this section is used by scripts/preprocess_videos.py --config <this_file>
 preprocess:
@@ -58,7 +58,7 @@ model:
   grad_checkpoint: true
 
 training:
-  mode: bandwise
+  mode: vanilla
   batch_size: 1
   grad_accum_steps: 4
   num_workers: 4
@@ -91,8 +91,8 @@ training:
 
 sampling:
   # Used by eval_stageA.py if CLI doesn't override
-  checkpoint: /home/jzx/K-Flow/runs/stageA_bandwise_1p15b_ucf101_320x240_25fps_f120/checkpoints/last.pt
-  out: /home/jzx/K-Flow/runs/stageA_bandwise_1p15b_ucf101_320x240_25fps_f120/samples/sample.mp4
+  checkpoint: /home/jzx/K-Flow/runs/stageA_vanilla_1p15b_ucf101_320x240_25fps_f120/checkpoints/last.pt
+  out: /home/jzx/K-Flow/runs/stageA_vanilla_1p15b_ucf101_320x240_25fps_f120/samples/sample.mp4
   steps_per_band: 32
   fps: 25
   seed: 42
@@ -104,7 +104,7 @@ sampling:
 monitor:
   enabled: true
   every_epochs: 1
-  output_dir: /home/jzx/K-Flow/runs/stageA_bandwise_1p15b_ucf101_320x240_25fps_f120/monitor_samples
+  output_dir: /home/jzx/K-Flow/runs/stageA_vanilla_1p15b_ucf101_320x240_25fps_f120/monitor_samples
   num_samples: 1
   seed: 42
   class_label: 0
@@ -117,7 +117,7 @@ monitor:
 quality_monitor:
   enabled: false
   real_manifest: /home/jzx/K-Flow/data_cache_ucf101_320x240_25fps_f120/val_manifest.jsonl
-  output_jsonl: /home/jzx/K-Flow/runs/stageA_bandwise_1p15b_ucf101_320x240_25fps_f120/quality_metrics.jsonl
+  output_jsonl: /home/jzx/K-Flow/runs/stageA_vanilla_1p15b_ucf101_320x240_25fps_f120/quality_metrics.jsonl
   num_samples: 64
   seed_start: 1000
   max_videos: 64

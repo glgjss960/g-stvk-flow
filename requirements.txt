@@ -6,3 +6,7 @@ tqdm>=4.66.0
 Pillow>=10.0.0
 # Optional: enables official flow_matching ODESolver backend.
 torchdiffeq>=0.2.4
+# Optional metrics for stageA quality monitoring.
+# scipy>=1.10.0
+# lpips>=0.1.4
+# opencv-python>=4.8.0
