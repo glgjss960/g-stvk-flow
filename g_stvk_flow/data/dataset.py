@@ -8,6 +8,20 @@ import torch
 from torch.utils.data import Dataset
 
 
+def _decode_cached_video(video: torch.Tensor, video_range: object | None) -> torch.Tensor:
+    if not isinstance(video, torch.Tensor):
+        raise TypeError(f"Expected tensor for video payload, got {type(video)}")
+
+    if video.dtype == torch.uint8:
+        # Stored as uint8 [0,255], decode back to float [-1,1].
+        return video.to(torch.float32) / 127.5 - 1.0
+
+    out = video.to(torch.float32)
+    if isinstance(video_range, str) and video_range.strip().lower() in {"float_0_1", "0_1"}:
+        out = out * 2.0 - 1.0
+    return out
+
+
 class CachedVideoDataset(Dataset):
     def __init__(self, manifest_path: str | Path) -> None:
         self.manifest_path = Path(manifest_path)
@@ -25,13 +39,13 @@ class CachedVideoDataset(Dataset):
         payload = torch.load(rec["tensor_path"], map_location="cpu")
 
         if isinstance(payload, dict):
-            video = payload["video"].float()
+            video = _decode_cached_video(payload["video"], payload.get("video_range", None))
             label = int(payload.get("label", rec.get("label", 0)))
         else:
-            video = payload.float()
+            video = _decode_cached_video(payload, None)
             label = int(rec.get("label", 0))
 
         return {
-            "video": video,  # [C,T,H,W]
+            "video": video,  # [C,T,H,W], float in [-1,1]
             "label": torch.tensor(label, dtype=torch.long),
         }

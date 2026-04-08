@@ -22,17 +22,34 @@ def _load_manifest(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _tensor_to_float_video_chw(video: torch.Tensor) -> torch.Tensor:
-    # input [T,H,W,C] uint8 or [C,T,H,W] float[-1,1]
+def _tensor_to_float_video_chw(video: torch.Tensor, *, video_range: str | None = None) -> torch.Tensor:
+    # input could be:
+    # - [T,H,W,C] uint8
+    # - [C,T,H,W] float[-1,1] / float[0,1] / uint8[0,255]
     if video.ndim != 4:
         raise ValueError(f"Expected 4D video tensor, got {tuple(video.shape)}")
+
+    vr = str(video_range).strip().lower() if video_range is not None else ""
+
+    # [T,H,W,C]
     if video.shape[-1] == 3:
-        # [T,H,W,C] uint8
-        v = video.permute(3, 0, 1, 2).contiguous().to(torch.float32) / 255.0
-        v = v * 2.0 - 1.0
+        v = video.permute(3, 0, 1, 2).contiguous().to(torch.float32)
+        if video.dtype == torch.uint8 or vr in {"uint8_0_255", "0_255"}:
+            v = v / 255.0
+            v = v * 2.0 - 1.0
+            return v
+        if vr in {"float_0_1", "0_1"}:
+            v = v * 2.0 - 1.0
         return v
-    # assume [C,T,H,W]
-    return video.to(torch.float32)
+
+    # [C,T,H,W]
+    v = video.to(torch.float32)
+    if video.dtype == torch.uint8 or vr in {"uint8_0_255", "0_255"}:
+        v = v / 127.5 - 1.0
+        return v
+    if vr in {"float_0_1", "0_1"}:
+        v = v * 2.0 - 1.0
+    return v
 
 
 def _load_generated_videos(gen_dir: Path, max_videos: int) -> list[torch.Tensor]:
@@ -55,9 +72,11 @@ def _load_real_videos(manifest_path: Path, max_videos: int) -> list[torch.Tensor
         payload = torch.load(r["tensor_path"], map_location="cpu")
         if isinstance(payload, dict):
             video = payload["video"]
+            video_range = payload.get("video_range", None)
         else:
             video = payload
-        videos.append(_tensor_to_float_video_chw(video))
+            video_range = None
+        videos.append(_tensor_to_float_video_chw(video, video_range=video_range))
     return videos
 
 

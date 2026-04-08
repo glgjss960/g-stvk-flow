@@ -1,6 +1,10 @@
 ﻿from __future__ import annotations
 
 import json
+import os
+import shutil
+import time
+import uuid
 from pathlib import Path
 from typing import Dict, List
 
@@ -92,6 +96,83 @@ def _to_clip_tensor(
     return clip
 
 
+def _normalize_cache_dtype(cache_dtype: str) -> str:
+    d = str(cache_dtype).strip().lower()
+    if d not in {"float32", "float16", "uint8"}:
+        raise ValueError(f"Unsupported cache_dtype={cache_dtype}, expected one of: float32, float16, uint8")
+    return d
+
+
+def _convert_clip_for_cache(clip: torch.Tensor, cache_dtype: str) -> torch.Tensor:
+    d = _normalize_cache_dtype(cache_dtype)
+    if d == "float32":
+        return clip.to(torch.float32).contiguous()
+    if d == "float16":
+        return clip.to(torch.float16).contiguous()
+    # d == "uint8": quantize from [-1,1] to [0,255]
+    return ((clip + 1.0) * 127.5).round().clamp(0.0, 255.0).to(torch.uint8).contiguous()
+
+
+def _video_range_for_cache_dtype(cache_dtype: str) -> str:
+    return "uint8_0_255" if _normalize_cache_dtype(cache_dtype) == "uint8" else "float_-1_1"
+
+
+def _safe_torch_save(
+    payload: object,
+    path: Path,
+    *,
+    use_new_zipfile_serialization: bool,
+    max_retries: int,
+    retry_backoff_seconds: float,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    max_retries = max(1, int(max_retries))
+    retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
+    last_error: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        tmp_path = path.parent / f"{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+        try:
+            with tmp_path.open("wb") as f:
+                torch.save(payload, f, _use_new_zipfile_serialization=use_new_zipfile_serialization)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+
+            # Best effort: fsync parent directory to reduce rename-loss risk on crashes.
+            try:
+                flags = os.O_RDONLY
+                if hasattr(os, "O_DIRECTORY"):
+                    flags = flags | os.O_DIRECTORY
+                dir_fd = os.open(str(path.parent), flags)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except Exception:
+                pass
+            return
+        except Exception as exc:  # pragma: no cover
+            last_error = exc
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+            if attempt < max_retries:
+                time.sleep(retry_backoff_seconds * attempt)
+
+    usage = shutil.disk_usage(path.parent)
+    free_gib = usage.free / (1024**3)
+    total_gib = usage.total / (1024**3)
+    raise RuntimeError(
+        f"Failed to save clip after {max_retries} attempts: {path}. "
+        f"Last error: {last_error}. "
+        f"Filesystem free/total={free_gib:.2f}/{total_gib:.2f} GiB under {path.parent}. "
+        "This usually indicates quota/disk exhaustion or unstable network filesystem writes."
+    )
+
+
 def preprocess_video_folder(
     raw_dir: str | Path,
     out_dir: str | Path,
@@ -103,6 +184,10 @@ def preprocess_video_folder(
     image_width: int | None = None,
     target_fps: float | None = None,
     tail_pad_last_window: bool = True,
+    cache_dtype: str = "float16",
+    save_new_zipfile_serialization: bool = False,
+    save_retries: int = 5,
+    save_retry_backoff_seconds: float = 0.5,
 ) -> None:
     raw_dir = Path(raw_dir)
     out_dir = Path(out_dir)
@@ -117,6 +202,10 @@ def preprocess_video_folder(
     stride = int(stride or frames)
     if stride <= 0:
         raise ValueError("stride must be > 0")
+
+    cache_dtype = _normalize_cache_dtype(cache_dtype)
+    save_retries = max(1, int(save_retries))
+    save_retry_backoff_seconds = max(0.0, float(save_retry_backoff_seconds))
 
     videos = _discover_videos(raw_dir)
     if not videos:
@@ -160,20 +249,29 @@ def preprocess_video_folder(
                 image_height=image_height,
                 image_width=image_width,
             )
+            clip_cached = _convert_clip_for_cache(clip, cache_dtype=cache_dtype)
+
             tensor_path = clips_dir / f"clip_{clip_index:08d}.pt"
             clip_index += 1
 
-            torch.save(
-                {
-                    "video": clip,
-                    "label": label,
-                    "class_name": class_name,
-                    "source": source_key,
-                    "start": int(start),
-                    "frames": int(frames),
-                    "fps": float(target_fps) if target_fps is not None else (float(src_fps) if src_fps is not None else None),
-                },
-                tensor_path,
+            payload = {
+                "video": clip_cached,
+                "video_range": _video_range_for_cache_dtype(cache_dtype),
+                "cache_dtype": cache_dtype,
+                "label": label,
+                "class_name": class_name,
+                "source": source_key,
+                "start": int(start),
+                "frames": int(frames),
+                "fps": float(target_fps) if target_fps is not None else (float(src_fps) if src_fps is not None else None),
+            }
+
+            _safe_torch_save(
+                payload=payload,
+                path=tensor_path,
+                use_new_zipfile_serialization=bool(save_new_zipfile_serialization),
+                max_retries=save_retries,
+                retry_backoff_seconds=save_retry_backoff_seconds,
             )
 
             entries.append(
@@ -225,6 +323,10 @@ def preprocess_video_folder(
         "stride": int(stride),
         "target_fps": float(target_fps) if target_fps is not None else None,
         "tail_pad_last_window": bool(tail_pad_last_window),
+        "cache_dtype": cache_dtype,
+        "save_new_zipfile_serialization": bool(save_new_zipfile_serialization),
+        "save_retries": save_retries,
+        "save_retry_backoff_seconds": save_retry_backoff_seconds,
         "observed_source_fps": sorted({round(v, 6) for v in observed_src_fps}),
     }
     (out_dir / "stats.json").write_text(json.dumps(stats, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
@@ -232,3 +334,9 @@ def preprocess_video_folder(
     print(f"Preprocessed {len(entries)} clips from {len(unique_sources)} videos into {out_dir}")
     print(f"Classes: {class_to_idx}")
     print(f"Split by source videos: train={len(train_sources)}, val={len(val_sources)}")
+    print(
+        "Cache write settings: "
+        f"cache_dtype={cache_dtype}, "
+        f"new_zip={bool(save_new_zipfile_serialization)}, retries={save_retries}, backoff={save_retry_backoff_seconds}s"
+    )
+

@@ -15,6 +15,10 @@ preprocess:
   fps: 25
   train_ratio: 0.9
   tail_pad_last_window: true
+  cache_dtype: float16
+  save_new_zipfile_serialization: false
+  save_retries: 5
+  save_retry_backoff_seconds: 0.5
 
 data:
   manifest_train: /home/jzx/K-Flow/data_cache_ucf101_320x240_25fps_f120/train_manifest.jsonl
@@ -125,3 +129,4 @@ quality_monitor:
   feature_size: 112
   feature_batch_size: 8
   feature_pretrained: true
+

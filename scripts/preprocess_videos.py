@@ -60,6 +60,37 @@ def main() -> None:
         action="store_false",
         help="disable tail padding; keep only full windows",
     )
+
+    parser.add_argument(
+        "--cache-dtype",
+        type=str,
+        choices=["float32", "float16", "uint8"],
+        default=None,
+        help="cache tensor dtype on disk; uint8 reduces disk usage the most",
+    )
+
+    parser.add_argument(
+        "--save-new-zipfile-serialization",
+        dest="save_new_zipfile_serialization",
+        action="store_true",
+        default=None,
+        help="use torch new zipfile serialization (default: false for better network-FS compatibility)",
+    )
+    parser.add_argument(
+        "--save-legacy-serialization",
+        dest="save_new_zipfile_serialization",
+        action="store_false",
+        help="use legacy torch serialization (recommended on unstable/network filesystems)",
+    )
+
+    parser.add_argument("--save-retries", type=int, default=None, help="retry count when clip write fails")
+    parser.add_argument(
+        "--save-retry-backoff-seconds",
+        type=float,
+        default=None,
+        help="backoff multiplier between save retries",
+    )
+
     args = parser.parse_args()
 
     cfg: dict[str, Any] = {}
@@ -82,6 +113,15 @@ def main() -> None:
     train_ratio = float(_pick(args.train_ratio, pre_cfg.get("train_ratio"), 0.9))
     tail_pad_last_window = bool(_pick(args.tail_pad_last_window, pre_cfg.get("tail_pad_last_window"), True))
 
+    cache_dtype = str(_pick(args.cache_dtype, pre_cfg.get("cache_dtype"), "float16"))
+    save_new_zipfile_serialization = bool(
+        _pick(args.save_new_zipfile_serialization, pre_cfg.get("save_new_zipfile_serialization"), False)
+    )
+    save_retries = int(_pick(args.save_retries, pre_cfg.get("save_retries"), 5))
+    save_retry_backoff_seconds = float(
+        _pick(args.save_retry_backoff_seconds, pre_cfg.get("save_retry_backoff_seconds"), 0.5)
+    )
+
     if raw_dir is None or out_dir is None:
         raise ValueError("raw_dir and out_dir must be provided either by CLI or yaml config")
 
@@ -96,8 +136,13 @@ def main() -> None:
         train_ratio=train_ratio,
         stride=stride,
         tail_pad_last_window=tail_pad_last_window,
+        cache_dtype=cache_dtype,
+        save_new_zipfile_serialization=save_new_zipfile_serialization,
+        save_retries=save_retries,
+        save_retry_backoff_seconds=save_retry_backoff_seconds,
     )
 
 
 if __name__ == "__main__":
     main()
+
