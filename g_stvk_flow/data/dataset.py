@@ -13,13 +13,20 @@ def _decode_cached_video(video: torch.Tensor, video_range: object | None) -> tor
         raise TypeError(f"Expected tensor for video payload, got {type(video)}")
 
     if video.dtype == torch.uint8:
-        # Stored as uint8 [0,255], decode back to float [-1,1].
-        return video.to(torch.float32) / 127.5 - 1.0
+        # Stored as uint8 [0,255], decode back to bfloat16 [-1,1].
+        return (video.to(torch.float32) / 127.5 - 1.0).to(torch.bfloat16)
 
     out = video.to(torch.float32)
     if isinstance(video_range, str) and video_range.strip().lower() in {"float_0_1", "0_1"}:
         out = out * 2.0 - 1.0
-    return out
+    return out.to(torch.bfloat16)
+
+
+def _torch_load_compat(path: str | Path) -> object:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
 
 
 class CachedVideoDataset(Dataset):
@@ -36,7 +43,7 @@ class CachedVideoDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         rec = self.items[idx]
-        payload = torch.load(rec["tensor_path"], map_location="cpu")
+        payload = _torch_load_compat(rec["tensor_path"])
 
         if isinstance(payload, dict):
             video = _decode_cached_video(payload["video"], payload.get("video_range", None))
@@ -46,6 +53,6 @@ class CachedVideoDataset(Dataset):
             label = int(rec.get("label", 0))
 
         return {
-            "video": video,  # [C,T,H,W], float in [-1,1]
+            "video": video,  # [C,T,H,W], bfloat16 in [-1,1]
             "label": torch.tensor(label, dtype=torch.long),
         }
