@@ -2,16 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import yaml
 from torch.cuda.amp import GradScaler, autocast
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from g_stvk_flow.data import CachedVideoDataset
@@ -27,7 +32,56 @@ def _set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, None)
+    if raw is None:
+        return int(default)
+    try:
+        return int(raw)
+    except ValueError:
+        return int(default)
+
+
+def _init_distributed_from_env() -> tuple[bool, int, int, int]:
+    world_size = _env_int("WORLD_SIZE", 1)
+    rank = _env_int("RANK", 0)
+    local_rank = _env_int("LOCAL_RANK", 0)
+
+    use_ddp = world_size > 1
+    if not use_ddp:
+        return False, rank, local_rank, world_size
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("torchrun/DDP mode requires CUDA")
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is not available in this build")
+
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+
+    return True, rank, local_rank, world_size
+
+
+def _cleanup_distributed() -> None:
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def _is_main_process(rank: int) -> bool:
+    return int(rank) == 0
+
+
+def _sync_sum_count(sum_value: float, count_value: int, device: torch.device) -> tuple[float, int]:
+    if dist.is_available() and dist.is_initialized():
+        stats = torch.tensor([float(sum_value), float(count_value)], device=device, dtype=torch.float64)
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        return float(stats[0].item()), int(stats[1].item())
+    return float(sum_value), int(count_value)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -99,6 +153,7 @@ def _build_loader(
     is_train: bool,
     device: torch.device,
     train_cfg: dict[str, Any],
+    sampler: DistributedSampler | None = None,
 ) -> DataLoader:
     pin_memory_default = device.type == "cuda"
     pin_memory = bool(train_cfg.get("pin_memory", pin_memory_default))
@@ -110,12 +165,14 @@ def _build_loader(
     kwargs: dict[str, Any] = {
         "dataset": dataset,
         "batch_size": int(batch_size),
-        "shuffle": shuffle,
+        "shuffle": (shuffle if sampler is None else False),
         "num_workers": int(num_workers),
         "pin_memory": pin_memory,
         "drop_last": drop_last,
         "persistent_workers": persistent_workers,
     }
+    if sampler is not None:
+        kwargs["sampler"] = sampler
     if prefetch_factor is not None and int(num_workers) > 0:
         kwargs["prefetch_factor"] = int(prefetch_factor)
 
@@ -335,296 +392,362 @@ def main() -> None:
     cfg_root = cfg_path.parent
     cfg = _load_yaml(cfg_path)
 
-    _set_seed(int(cfg.get("seed", 42)))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_ddp = False
+    rank = 0
+    local_rank = 0
+    world_size = 1
 
-    run_dir = _resolve(cfg_root, cfg["run"]["output_dir"])
-    assert run_dir is not None
-    run_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_dir = run_dir / "checkpoints"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = run_dir / "metrics.jsonl"
+    try:
+        use_ddp, rank, local_rank, world_size = _init_distributed_from_env()
+        is_main = _is_main_process(rank)
 
-    data_cfg = cfg["data"]
-    train_cfg = cfg["training"]
-    monitor_cfg = cfg.get("monitor", {})
-    vae_cfg = cfg.get("vae", {})
+        base_seed = int(cfg.get("seed", 42))
+        _set_seed(base_seed + rank)
 
-    data_tensor_dtype = _dtype_from_string(data_cfg.get("tensor_dtype", data_cfg.get("dtype", "float32")))
-    vae_runtime_dtype = _dtype_from_string(vae_cfg.get("dtype", "float32"))
-    monitor_decode_dtype = _dtype_from_string(monitor_cfg.get("decode_dtype", vae_cfg.get("dtype", "float32")))
+        if use_ddp:
+            device = torch.device("cuda", local_rank)
+        else:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    train_manifest = _resolve(cfg_root, data_cfg["manifest_train"])
-    val_manifest = _resolve(cfg_root, data_cfg.get("manifest_val"))
-    if train_manifest is None:
-        raise ValueError("manifest_train is required")
+        if is_main and use_ddp:
+            print(f"DDP enabled: world_size={world_size}, rank={rank}, local_rank={local_rank}")
 
-    train_ds = CachedVideoDataset(train_manifest, output_dtype=data_tensor_dtype)
-    val_ds = (
-        CachedVideoDataset(val_manifest, output_dtype=data_tensor_dtype)
-        if (val_manifest is not None and val_manifest.exists())
-        else None
-    )
+        run_dir = _resolve(cfg_root, cfg["run"]["output_dir"])
+        assert run_dir is not None
+        run_dir.mkdir(parents=True, exist_ok=True)
+        ckpt_dir = run_dir / "checkpoints"
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        metrics_path = run_dir / "metrics.jsonl"
 
-    batch_size = int(train_cfg.get("batch_size", 4))
-    num_workers = int(train_cfg.get("num_workers", 2))
+        data_cfg = cfg["data"]
+        train_cfg = cfg["training"]
+        monitor_cfg = cfg.get("monitor", {})
+        vae_cfg = cfg.get("vae", {})
 
-    train_loader = _build_loader(
-        dataset=train_ds,
-        batch_size=batch_size,
-        num_workers=num_workers,
-        is_train=True,
-        device=device,
-        train_cfg=train_cfg,
-    )
+        data_tensor_dtype = _dtype_from_string(data_cfg.get("tensor_dtype", data_cfg.get("dtype", "float32")))
+        vae_runtime_dtype = _dtype_from_string(vae_cfg.get("dtype", "float32"))
+        monitor_decode_dtype = _dtype_from_string(monitor_cfg.get("decode_dtype", vae_cfg.get("dtype", "float32")))
 
-    val_loader = None
-    if val_ds is not None:
-        val_loader = _build_loader(
-            dataset=val_ds,
+        train_manifest = _resolve(cfg_root, data_cfg["manifest_train"])
+        val_manifest = _resolve(cfg_root, data_cfg.get("manifest_val"))
+        if train_manifest is None:
+            raise ValueError("manifest_train is required")
+
+        train_ds = CachedVideoDataset(train_manifest, output_dtype=data_tensor_dtype)
+        val_ds = (
+            CachedVideoDataset(val_manifest, output_dtype=data_tensor_dtype)
+            if (val_manifest is not None and val_manifest.exists())
+            else None
+        )
+
+        batch_size = int(train_cfg.get("batch_size", 4))
+        num_workers = int(train_cfg.get("num_workers", 2))
+
+        train_sampler = None
+        if use_ddp:
+            train_sampler = DistributedSampler(
+                train_ds,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=bool(train_cfg.get("shuffle_train", True)),
+                drop_last=bool(train_cfg.get("drop_last_train", True)),
+            )
+
+        train_loader = _build_loader(
+            dataset=train_ds,
             batch_size=batch_size,
             num_workers=num_workers,
-            is_train=False,
+            is_train=True,
             device=device,
             train_cfg=train_cfg,
+            sampler=train_sampler,
         )
 
-    decomp_mode = str(cfg["decomposition"].get("mode", "spatial_temporal"))
-    decomposer = SeparableHaarVideoDecomposer(mode=decomp_mode)
-    fixed_path = FixedBandPath(
-        band_names=decomposer.band_names,
-        path_name=str(cfg["path"].get("name", "A")),
-    )
-
-    model = _build_model(cfg=cfg, num_bands=len(decomposer.band_names), device=device)
-    _print_model_stats(model)
-
-    vae = VideoVAEWrapper(
-        backend=str(vae_cfg.get("backend", "identity")),
-        open_sora_root=_resolve(cfg_root, vae_cfg.get("open_sora_root")),
-        pretrained_path=str(_resolve(cfg_root, vae_cfg.get("pretrained_path"))) if vae_cfg.get("pretrained_path") else None,
-        device=device,
-        dtype=vae_runtime_dtype,
-        freeze=bool(vae_cfg.get("freeze", True)),
-        sample_posterior=bool(vae_cfg.get("sample_posterior", False)),
-    ).to(device)
-
-    in_channels = int(data_cfg["in_channels"])
-    if vae.latent_channels is not None and in_channels != int(vae.latent_channels):
-        raise ValueError(
-            f"data.in_channels={in_channels} mismatches VAE latent_channels={vae.latent_channels}. "
-            "Use the VAE latent channel count in config."
-        )
-
-    raw_frames = int(data_cfg["frames"])
-    raw_h, raw_w = _get_data_hw(data_cfg)
-    raw_fps = data_cfg.get("fps", None)
-    latent_t, latent_h, latent_w = vae.get_latent_size(raw_frames, raw_h, raw_w)
-    fps_msg = f", fps={raw_fps}" if raw_fps is not None else ""
-    print(
-        f"Raw clip shape (T,H,W)=({raw_frames},{raw_h},{raw_w}){fps_msg} -> "
-        f"Latent shape (T,H,W)=({latent_t},{latent_h},{latent_w})"
-    )
-
-    if decomp_mode in {"spatial_temporal", "temporal_only"} and latent_t % 2 != 0:
-        raise ValueError(
-            f"Latent temporal length must be even for temporal Haar split, got T={latent_t}. "
-            "Adjust data.frames (raw clip length)."
-        )
-    if decomp_mode in {"spatial_temporal", "spatial_only"} and ((latent_h % 2 != 0) or (latent_w % 2 != 0)):
-        raise ValueError(
-            f"Latent spatial size must be even for spatial Haar split, got (H,W)=({latent_h},{latent_w}). "
-            "Adjust data.image_height/image_width."
-        )
-
-    train_mode = str(train_cfg.get("mode", "bandwise")).lower().strip()
-    if train_mode not in {"bandwise", "vanilla"}:
-        raise ValueError(f"Unsupported training.mode={train_mode}, expected bandwise or vanilla")
-
-    flow_root = _resolve(cfg_root, train_cfg.get("flow_matching_root"))
-    band_objective = BandwiseDiffusionObjective(
-        decomposer=decomposer,
-        fixed_path=fixed_path,
-        target_type=str(train_cfg.get("target_type", "epsilon")),
-        scheduler_name=str(train_cfg.get("scheduler", "cosine")),
-        flow_matching_root=flow_root,
-        band_weights=train_cfg.get("band_weights", None),
-    )
-    vanilla_objective = VanillaDiffusionObjective(
-        target_type=str(train_cfg.get("target_type", "epsilon")),
-        scheduler_name=str(train_cfg.get("scheduler", "cosine")),
-        flow_matching_root=flow_root,
-    )
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(train_cfg.get("lr", 1e-4)),
-        weight_decay=float(train_cfg.get("weight_decay", 0.01)),
-    )
-
-    scaler = GradScaler(enabled=bool(train_cfg.get("amp", True)) and device.type == "cuda")
-    amp_enabled = bool(train_cfg.get("amp", True)) and device.type == "cuda"
-
-    start_epoch = 0
-    global_step = 0
-    if args.resume is not None and args.resume.exists():
-        ckpt = load_checkpoint(args.resume, map_location=device)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = int(ckpt.get("epoch", 0))
-        global_step = int(ckpt.get("global_step", 0))
-        print(f"Resumed from {args.resume} at epoch={start_epoch}, step={global_step}")
-
-    epochs = int(train_cfg.get("epochs", 100))
-    log_every = int(train_cfg.get("log_every", 20))
-    save_every = int(train_cfg.get("save_every", 1))
-    grad_clip = float(train_cfg.get("grad_clip", 1.0))
-    grad_accum_steps = max(1, int(train_cfg.get("grad_accum_steps", 1)))
-
-    eval_full_bandwise = bool(train_cfg.get("eval_full_bandwise", True))
-    eval_track_band_losses = bool(train_cfg.get("eval_track_band_losses", True))
-
-    for epoch in range(start_epoch, epochs):
-        pbar = tqdm(train_loader, desc=f"stageA epoch {epoch}", leave=False)
-        running = 0.0
-        optimizer.zero_grad(set_to_none=True)
-
-        epoch_loss_sum = 0.0
-        epoch_loss_count = 0
-
-        for batch_idx, batch in enumerate(pbar):
-            video = batch["video"].to(device=device, dtype=vae_runtime_dtype)
-            labels = batch["label"].to(device)
-
-            if video.ndim != 5:
-                raise ValueError(f"Expected input video shape [B,C,T,H,W], got {tuple(video.shape)}")
-            if video.shape[2] != raw_frames or video.shape[3] != raw_h or video.shape[4] != raw_w:
-                raise ValueError(
-                    "Batch video shape mismatches config: "
-                    f"got (T,H,W)=({video.shape[2]},{video.shape[3]},{video.shape[4]}), "
-                    f"expected ({raw_frames},{raw_h},{raw_w})"
-                )
-
-            z = vae.encode(video)
-            if z.shape[1] != in_channels:
-                raise ValueError(
-                    f"Encoded latent channels mismatch: z has C={z.shape[1]}, expected data.in_channels={in_channels}"
-                )
-
-            t = torch.rand(z.shape[0], device=device, dtype=z.dtype)
-
-            if train_mode == "bandwise":
-                band_name = random.choice(list(fixed_path.order))
-                state = band_objective.build_state(clean_latent=z, t=t, band_name=band_name)
-                band_id = torch.full((z.shape[0],), fixed_path.index_of(band_name), dtype=torch.long, device=device)
-
-                with autocast(enabled=amp_enabled):
-                    pred = model(x=state.x_t, t=t, band_id=band_id, class_labels=labels)
-                    loss = band_objective.compute_loss(pred, state)
-            else:
-                x_t, target = vanilla_objective.build_state(clean_latent=z, t=t)
-                band_id = torch.zeros((z.shape[0],), dtype=torch.long, device=device)
-                with autocast(enabled=amp_enabled):
-                    pred = model(x=x_t, t=t, band_id=band_id, class_labels=labels)
-                    loss = vanilla_objective.compute_loss(pred, target)
-
-            loss_for_backward = loss / float(grad_accum_steps)
-            scaler.scale(loss_for_backward).backward()
-
-            should_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == len(train_loader))
-            if should_step:
-                if grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-                global_step += 1
-
-                lv = float(loss.item())
-                running += lv
-                epoch_loss_sum += lv
-                epoch_loss_count += 1
-
-                if global_step % log_every == 0:
-                    pbar.set_postfix({"loss": f"{running / log_every:.6f}", "mode": train_mode})
-                    running = 0.0
-
-        train_loss_epoch = epoch_loss_sum / max(epoch_loss_count, 1)
-
-        val_loss = None
-        val_band_loss: dict[str, float] = {}
-        if val_loader is not None:
-            val_loss, val_band_loss = _run_eval(
-                model=model,
-                vae=vae,
-                loader=val_loader,
+        val_loader = None
+        if val_ds is not None and ((not use_ddp) or is_main):
+            val_loader = _build_loader(
+                dataset=val_ds,
+                batch_size=batch_size,
+                num_workers=num_workers,
+                is_train=False,
                 device=device,
-                train_mode=train_mode,
-                fixed_path=fixed_path,
-                band_objective=band_objective,
-                vanilla_objective=vanilla_objective,
-                decomposer=decomposer,
-                amp_enabled=amp_enabled,
-                raw_frames=raw_frames,
-                raw_h=raw_h,
-                raw_w=raw_w,
-                in_channels=in_channels,
-                eval_full_bandwise=eval_full_bandwise,
-                eval_track_band_losses=eval_track_band_losses,
-                vae_input_dtype=vae_runtime_dtype,
-            )
-            print(f"[epoch {epoch}] val_loss={val_loss:.6f}")
-            if val_band_loss:
-                band_msg = " ".join([f"{k}={v:.6f}" for k, v in val_band_loss.items()])
-                print(f"[epoch {epoch}] val_band_loss {band_msg}")
-
-        monitor_metrics: dict[str, Any] = {}
-        if (epoch + 1) % save_every == 0:
-            state = {
-                "epoch": epoch + 1,
-                "global_step": global_step,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "config": cfg,
-                "val_loss": val_loss,
-                "val_band_loss": val_band_loss,
-            }
-            save_checkpoint(state, ckpt_dir / "last.pt")
-            save_checkpoint(state, ckpt_dir / f"epoch_{epoch + 1:04d}.pt")
-
-            monitor_metrics = _run_monitor_samples(
-                model=model,
-                vae=vae,
-                decomposer=decomposer,
-                fixed_path=fixed_path,
-                cfg_root=cfg_root,
-                cfg=cfg,
-                data_cfg=data_cfg,
                 train_cfg=train_cfg,
-                monitor_cfg=monitor_cfg,
-                run_dir=run_dir,
-                epoch=epoch,
-                device=device,
-                decode_dtype=monitor_decode_dtype,
+                sampler=None,
             )
 
-        record: dict[str, Any] = {
-            "epoch": epoch + 1,
-            "global_step": global_step,
-            "mode": train_mode,
-            "train_loss": train_loss_epoch,
-            "val_loss": val_loss,
-            "path_name": str(cfg.get("path", {}).get("name", "A")),
-            "target_type": str(train_cfg.get("target_type", "epsilon")),
-        }
-        for k, v in val_band_loss.items():
-            record[f"val_band_{k}"] = float(v)
-        record.update(monitor_metrics)
-        _append_jsonl(metrics_path, record)
+        decomp_mode = str(cfg["decomposition"].get("mode", "spatial_temporal"))
+        decomposer = SeparableHaarVideoDecomposer(mode=decomp_mode)
+        fixed_path = FixedBandPath(
+            band_names=decomposer.band_names,
+            path_name=str(cfg["path"].get("name", "A")),
+        )
+
+        model = _build_model(cfg=cfg, num_bands=len(decomposer.band_names), device=device)
+        if is_main:
+            _print_model_stats(model)
+
+        vae = VideoVAEWrapper(
+            backend=str(vae_cfg.get("backend", "identity")),
+            open_sora_root=_resolve(cfg_root, vae_cfg.get("open_sora_root")),
+            pretrained_path=str(_resolve(cfg_root, vae_cfg.get("pretrained_path"))) if vae_cfg.get("pretrained_path") else None,
+            device=device,
+            dtype=vae_runtime_dtype,
+            freeze=bool(vae_cfg.get("freeze", True)),
+            sample_posterior=bool(vae_cfg.get("sample_posterior", False)),
+        ).to(device)
+
+        in_channels = int(data_cfg["in_channels"])
+        if vae.latent_channels is not None and in_channels != int(vae.latent_channels):
+            raise ValueError(
+                f"data.in_channels={in_channels} mismatches VAE latent_channels={vae.latent_channels}. "
+                "Use the VAE latent channel count in config."
+            )
+
+        raw_frames = int(data_cfg["frames"])
+        raw_h, raw_w = _get_data_hw(data_cfg)
+        raw_fps = data_cfg.get("fps", None)
+        latent_t, latent_h, latent_w = vae.get_latent_size(raw_frames, raw_h, raw_w)
+        if is_main:
+            fps_msg = f", fps={raw_fps}" if raw_fps is not None else ""
+            print(
+                f"Raw clip shape (T,H,W)=({raw_frames},{raw_h},{raw_w}){fps_msg} -> "
+                f"Latent shape (T,H,W)=({latent_t},{latent_h},{latent_w})"
+            )
+
+        if decomp_mode in {"spatial_temporal", "temporal_only"} and latent_t % 2 != 0:
+            raise ValueError(
+                f"Latent temporal length must be even for temporal Haar split, got T={latent_t}. "
+                "Adjust data.frames (raw clip length)."
+            )
+        if decomp_mode in {"spatial_temporal", "spatial_only"} and ((latent_h % 2 != 0) or (latent_w % 2 != 0)):
+            raise ValueError(
+                f"Latent spatial size must be even for spatial Haar split, got (H,W)=({latent_h},{latent_w}). "
+                "Adjust data.image_height/image_width."
+            )
+
+        train_mode = str(train_cfg.get("mode", "bandwise")).lower().strip()
+        if train_mode not in {"bandwise", "vanilla"}:
+            raise ValueError(f"Unsupported training.mode={train_mode}, expected bandwise or vanilla")
+
+        flow_root = _resolve(cfg_root, train_cfg.get("flow_matching_root"))
+        band_objective = BandwiseDiffusionObjective(
+            decomposer=decomposer,
+            fixed_path=fixed_path,
+            target_type=str(train_cfg.get("target_type", "epsilon")),
+            scheduler_name=str(train_cfg.get("scheduler", "cosine")),
+            flow_matching_root=flow_root,
+            band_weights=train_cfg.get("band_weights", None),
+        )
+        vanilla_objective = VanillaDiffusionObjective(
+            target_type=str(train_cfg.get("target_type", "epsilon")),
+            scheduler_name=str(train_cfg.get("scheduler", "cosine")),
+            flow_matching_root=flow_root,
+        )
+
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(train_cfg.get("lr", 1e-4)),
+            weight_decay=float(train_cfg.get("weight_decay", 0.01)),
+        )
+
+        scaler = GradScaler(enabled=bool(train_cfg.get("amp", True)) and device.type == "cuda")
+        amp_enabled = bool(train_cfg.get("amp", True)) and device.type == "cuda"
+
+        start_epoch = 0
+        global_step = 0
+        if args.resume is not None and args.resume.exists():
+            ckpt = load_checkpoint(args.resume, map_location=device)
+            model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            start_epoch = int(ckpt.get("epoch", 0))
+            global_step = int(ckpt.get("global_step", 0))
+            if is_main:
+                print(f"Resumed from {args.resume} at epoch={start_epoch}, step={global_step}")
+
+        model_for_train: torch.nn.Module
+        if use_ddp:
+            model_for_train = DDP(
+                model,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                broadcast_buffers=False,
+                find_unused_parameters=bool(train_cfg.get("ddp_find_unused_parameters", False)),
+            )
+        else:
+            model_for_train = model
+
+        model_for_io = model_for_train.module if isinstance(model_for_train, DDP) else model_for_train
+
+        epochs = int(train_cfg.get("epochs", 100))
+        log_every = int(train_cfg.get("log_every", 20))
+        save_every = int(train_cfg.get("save_every", 1))
+        grad_clip = float(train_cfg.get("grad_clip", 1.0))
+        grad_accum_steps = max(1, int(train_cfg.get("grad_accum_steps", 1)))
+
+        eval_full_bandwise = bool(train_cfg.get("eval_full_bandwise", True))
+        eval_track_band_losses = bool(train_cfg.get("eval_track_band_losses", True))
+
+        if is_main:
+            effective_global_batch = int(batch_size) * int(grad_accum_steps) * int(world_size)
+            print(f"Effective global batch={effective_global_batch} (batch_size*grad_accum_steps*world_size)")
+
+        for epoch in range(start_epoch, epochs):
+            if use_ddp and train_sampler is not None:
+                train_sampler.set_epoch(epoch)
+
+            iterator = tqdm(train_loader, desc=f"stageA epoch {epoch}", leave=False) if is_main else train_loader
+            running = 0.0
+            optimizer.zero_grad(set_to_none=True)
+
+            epoch_loss_sum = 0.0
+            epoch_loss_count = 0
+
+            for batch_idx, batch in enumerate(iterator):
+                video = batch["video"].to(device=device, dtype=vae_runtime_dtype)
+                labels = batch["label"].to(device)
+
+                if video.ndim != 5:
+                    raise ValueError(f"Expected input video shape [B,C,T,H,W], got {tuple(video.shape)}")
+                if video.shape[2] != raw_frames or video.shape[3] != raw_h or video.shape[4] != raw_w:
+                    raise ValueError(
+                        "Batch video shape mismatches config: "
+                        f"got (T,H,W)=({video.shape[2]},{video.shape[3]},{video.shape[4]}), "
+                        f"expected ({raw_frames},{raw_h},{raw_w})"
+                    )
+
+                z = vae.encode(video)
+                if z.shape[1] != in_channels:
+                    raise ValueError(
+                        f"Encoded latent channels mismatch: z has C={z.shape[1]}, expected data.in_channels={in_channels}"
+                    )
+
+                t = torch.rand(z.shape[0], device=device, dtype=z.dtype)
+
+                if train_mode == "bandwise":
+                    band_name = random.choice(list(fixed_path.order))
+                    state = band_objective.build_state(clean_latent=z, t=t, band_name=band_name)
+                    band_id = torch.full((z.shape[0],), fixed_path.index_of(band_name), dtype=torch.long, device=device)
+
+                    with autocast(enabled=amp_enabled):
+                        pred = model_for_train(x=state.x_t, t=t, band_id=band_id, class_labels=labels)
+                        loss = band_objective.compute_loss(pred, state)
+                else:
+                    x_t, target = vanilla_objective.build_state(clean_latent=z, t=t)
+                    band_id = torch.zeros((z.shape[0],), dtype=torch.long, device=device)
+                    with autocast(enabled=amp_enabled):
+                        pred = model_for_train(x=x_t, t=t, band_id=band_id, class_labels=labels)
+                        loss = vanilla_objective.compute_loss(pred, target)
+
+                should_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == len(train_loader))
+                loss_for_backward = loss / float(grad_accum_steps)
+
+                sync_ctx = nullcontext()
+                if use_ddp and (not should_step) and isinstance(model_for_train, DDP):
+                    sync_ctx = model_for_train.no_sync()
+                with sync_ctx:
+                    scaler.scale(loss_for_backward).backward()
+
+                if should_step:
+                    if grad_clip > 0:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model_for_train.parameters(), grad_clip)
+
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+
+                    lv = float(loss.item())
+                    running += lv
+                    epoch_loss_sum += lv
+                    epoch_loss_count += 1
+
+                    if is_main and global_step % log_every == 0:
+                        if hasattr(iterator, "set_postfix"):
+                            iterator.set_postfix({"loss": f"{running / log_every:.6f}", "mode": train_mode})
+                        running = 0.0
+
+            epoch_loss_sum, epoch_loss_count = _sync_sum_count(epoch_loss_sum, epoch_loss_count, device)
+            train_loss_epoch = epoch_loss_sum / max(epoch_loss_count, 1)
+
+            val_loss = None
+            val_band_loss: dict[str, float] = {}
+            if val_loader is not None:
+                val_loss, val_band_loss = _run_eval(
+                    model=model_for_io,
+                    vae=vae,
+                    loader=val_loader,
+                    device=device,
+                    train_mode=train_mode,
+                    fixed_path=fixed_path,
+                    band_objective=band_objective,
+                    vanilla_objective=vanilla_objective,
+                    decomposer=decomposer,
+                    amp_enabled=amp_enabled,
+                    raw_frames=raw_frames,
+                    raw_h=raw_h,
+                    raw_w=raw_w,
+                    in_channels=in_channels,
+                    eval_full_bandwise=eval_full_bandwise,
+                    eval_track_band_losses=eval_track_band_losses,
+                    vae_input_dtype=vae_runtime_dtype,
+                )
+                if is_main:
+                    print(f"[epoch {epoch}] val_loss={val_loss:.6f}")
+                    if val_band_loss:
+                        band_msg = " ".join([f"{k}={v:.6f}" for k, v in val_band_loss.items()])
+                        print(f"[epoch {epoch}] val_band_loss {band_msg}")
+
+            monitor_metrics: dict[str, Any] = {}
+            if is_main and (epoch + 1) % save_every == 0:
+                state = {
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "model": model_for_io.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "config": cfg,
+                    "val_loss": val_loss,
+                    "val_band_loss": val_band_loss,
+                }
+                save_checkpoint(state, ckpt_dir / "last.pt")
+                save_checkpoint(state, ckpt_dir / f"epoch_{epoch + 1:04d}.pt")
+
+                monitor_metrics = _run_monitor_samples(
+                    model=model_for_io,
+                    vae=vae,
+                    decomposer=decomposer,
+                    fixed_path=fixed_path,
+                    cfg_root=cfg_root,
+                    cfg=cfg,
+                    data_cfg=data_cfg,
+                    train_cfg=train_cfg,
+                    monitor_cfg=monitor_cfg,
+                    run_dir=run_dir,
+                    epoch=epoch,
+                    device=device,
+                    decode_dtype=monitor_decode_dtype,
+                )
+
+            if is_main:
+                record: dict[str, Any] = {
+                    "epoch": epoch + 1,
+                    "global_step": global_step,
+                    "mode": train_mode,
+                    "train_loss": train_loss_epoch,
+                    "val_loss": val_loss,
+                    "path_name": str(cfg.get("path", {}).get("name", "A")),
+                    "target_type": str(train_cfg.get("target_type", "epsilon")),
+                }
+                for k, v in val_band_loss.items():
+                    record[f"val_band_{k}"] = float(v)
+                record.update(monitor_metrics)
+                _append_jsonl(metrics_path, record)
+
+            if use_ddp and dist.is_available() and dist.is_initialized():
+                dist.barrier()
+    finally:
+        _cleanup_distributed()
 
 
 if __name__ == "__main__":
     main()
-
