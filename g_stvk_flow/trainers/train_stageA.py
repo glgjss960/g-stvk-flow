@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -42,7 +42,9 @@ def _resolve(root: Path, maybe_path: str | None) -> Path | None:
     return p if p.is_absolute() else (root / p)
 
 
-def _dtype_from_string(name: str) -> torch.dtype:
+def _dtype_from_string(name: str | torch.dtype) -> torch.dtype:
+    if isinstance(name, torch.dtype):
+        return name
     name = str(name).lower().strip()
     if name in {"bf16", "bfloat16"}:
         return torch.bfloat16
@@ -143,6 +145,7 @@ def _run_eval(
     in_channels: int,
     eval_full_bandwise: bool,
     eval_track_band_losses: bool,
+    vae_input_dtype: torch.dtype,
 ) -> tuple[float, dict[str, float]]:
     model.eval()
 
@@ -154,7 +157,7 @@ def _run_eval(
 
     with torch.no_grad():
         for batch in loader:
-            video = batch["video"].to(device)
+            video = batch["video"].to(device=device, dtype=vae_input_dtype)
             labels = batch["label"].to(device)
 
             if video.ndim != 5:
@@ -231,6 +234,7 @@ def _run_monitor_samples(
     run_dir: Path,
     epoch: int,
     device: torch.device,
+    decode_dtype: torch.dtype,
 ) -> dict[str, Any]:
     if not bool(monitor_cfg.get("enabled", False)):
         return {}
@@ -289,7 +293,8 @@ def _run_monitor_samples(
                 class_labels=labels,
                 seed=seed,
             )
-            base_video = vae.decode(latent)
+            latent_for_decode = latent.to(device=device, dtype=decode_dtype)
+            base_video = vae.decode(latent_for_decode)
 
             base_path = out_dir / f"epoch_{epoch + 1:04d}_seed_{seed:06d}_base.mp4"
             save_video_tensor(base_video[0], base_path, fps=fps, scale=save_scale)
@@ -302,7 +307,8 @@ def _run_monitor_samples(
                 bands = {k: v.clone() for k, v in base_bands.items()}
                 bands[band_name] = bands[band_name] + ablate_scale * torch.randn_like(bands[band_name])
                 latent_ab = decomposer.inverse(bands)
-                video_ab = vae.decode(latent_ab)
+                latent_ab_for_decode = latent_ab.to(device=device, dtype=decode_dtype)
+                video_ab = vae.decode(latent_ab_for_decode)
 
                 ab_path = out_dir / f"epoch_{epoch + 1:04d}_seed_{seed:06d}_ablate_{band_name}.mp4"
                 save_video_tensor(video_ab[0], ab_path, fps=fps, scale=save_scale)
@@ -342,14 +348,23 @@ def main() -> None:
     data_cfg = cfg["data"]
     train_cfg = cfg["training"]
     monitor_cfg = cfg.get("monitor", {})
+    vae_cfg = cfg.get("vae", {})
+
+    data_tensor_dtype = _dtype_from_string(data_cfg.get("tensor_dtype", data_cfg.get("dtype", "float32")))
+    vae_runtime_dtype = _dtype_from_string(vae_cfg.get("dtype", "float32"))
+    monitor_decode_dtype = _dtype_from_string(monitor_cfg.get("decode_dtype", vae_cfg.get("dtype", "float32")))
 
     train_manifest = _resolve(cfg_root, data_cfg["manifest_train"])
     val_manifest = _resolve(cfg_root, data_cfg.get("manifest_val"))
     if train_manifest is None:
         raise ValueError("manifest_train is required")
 
-    train_ds = CachedVideoDataset(train_manifest)
-    val_ds = CachedVideoDataset(val_manifest) if (val_manifest is not None and val_manifest.exists()) else None
+    train_ds = CachedVideoDataset(train_manifest, output_dtype=data_tensor_dtype)
+    val_ds = (
+        CachedVideoDataset(val_manifest, output_dtype=data_tensor_dtype)
+        if (val_manifest is not None and val_manifest.exists())
+        else None
+    )
 
     batch_size = int(train_cfg.get("batch_size", 4))
     num_workers = int(train_cfg.get("num_workers", 2))
@@ -384,13 +399,12 @@ def main() -> None:
     model = _build_model(cfg=cfg, num_bands=len(decomposer.band_names), device=device)
     _print_model_stats(model)
 
-    vae_cfg = cfg.get("vae", {})
     vae = VideoVAEWrapper(
         backend=str(vae_cfg.get("backend", "identity")),
         open_sora_root=_resolve(cfg_root, vae_cfg.get("open_sora_root")),
         pretrained_path=str(_resolve(cfg_root, vae_cfg.get("pretrained_path"))) if vae_cfg.get("pretrained_path") else None,
         device=device,
-        dtype=_dtype_from_string(vae_cfg.get("dtype", "float32")),
+        dtype=vae_runtime_dtype,
         freeze=bool(vae_cfg.get("freeze", True)),
         sample_posterior=bool(vae_cfg.get("sample_posterior", False)),
     ).to(device)
@@ -479,7 +493,7 @@ def main() -> None:
         epoch_loss_count = 0
 
         for batch_idx, batch in enumerate(pbar):
-            video = batch["video"].to(device)
+            video = batch["video"].to(device=device, dtype=vae_runtime_dtype)
             labels = batch["label"].to(device)
 
             if video.ndim != 5:
@@ -559,6 +573,7 @@ def main() -> None:
                 in_channels=in_channels,
                 eval_full_bandwise=eval_full_bandwise,
                 eval_track_band_losses=eval_track_band_losses,
+                vae_input_dtype=vae_runtime_dtype,
             )
             print(f"[epoch {epoch}] val_loss={val_loss:.6f}")
             if val_band_loss:
@@ -592,6 +607,7 @@ def main() -> None:
                 run_dir=run_dir,
                 epoch=epoch,
                 device=device,
+                decode_dtype=monitor_decode_dtype,
             )
 
         record: dict[str, Any] = {
@@ -611,3 +627,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

@@ -1,12 +1,12 @@
-﻿seed: 42
+seed: 42
 
 run:
-  output_dir: /home/jzx/K-Flow/runs/stageA_bandwise_pathB_1p15b_ucf101_320x240_25fps_f120
+  output_dir: /map-vepfs/zhengxuan/st-vk-flow/runs/stageA_bandwise_pathB_1p15b_ucf101_320x240_25fps_f120
 
 # Optional: this section is used by scripts/preprocess_videos.py --config <this_file>
 preprocess:
-  raw_dir: /data/jzx/UCF-101
-  out_dir: /home/jzx/K-Flow/data_cache_ucf101_320x240_25fps_f120
+  raw_dir: /map-vepfs/zhengxuan/st-vk-flow/data/UCF101/UCF-101_raw
+  out_dir: /map-vepfs/zhengxuan/st-vk-flow/data/UCF101/data_cache_ucf101_320x240_25fps_f120
   frames: 120
   stride: 120
   image_height: 240
@@ -21,8 +21,8 @@ preprocess:
   save_retry_backoff_seconds: 0.5
 
 data:
-  manifest_train: /home/jzx/K-Flow/data_cache_ucf101_320x240_25fps_f120/train_manifest.jsonl
-  manifest_val: /home/jzx/K-Flow/data_cache_ucf101_320x240_25fps_f120/val_manifest.jsonl
+  manifest_train: /map-vepfs/zhengxuan/st-vk-flow/data/UCF101/data_cache_ucf101_320x240_25fps_f120/train_manifest.jsonl
+  manifest_val: /map-vepfs/zhengxuan/st-vk-flow/data/UCF101/data_cache_ucf101_320x240_25fps_f120/val_manifest.jsonl
   # For opensora_hunyuan backend, this must match latent z_channels.
   in_channels: 16
   # Raw-clip settings aligned with UCF requirement.
@@ -31,12 +31,13 @@ data:
   image_width: 320
   image_size: 240
   fps: 25
+  tensor_dtype: bfloat16
 
 vae:
   backend: opensora_hunyuan
-  open_sora_root: /home/jzx/Open-Sora
+  open_sora_root: /map-vepfs/zhengxuan/st-vk-flow/Open-Sora
   # Update this path to your local checkpoint location if needed.
-  pretrained_path: /home/jzx/Open-Sora/ckpts/hunyuan_vae.safetensors
+  pretrained_path: /map-vepfs/zhengxuan/st-vk-flow/Open-Sora/ckpts/hunyuan_vae.safetensors
   dtype: bfloat16
   freeze: true
   sample_posterior: false
@@ -86,7 +87,7 @@ training:
 
   target_type: velocity
   scheduler: cosine
-  flow_matching_root: /home/jzx/flow_matching
+  flow_matching_root: /map-vepfs/zhengxuan/st-vk-flow/flow_matching
   band_weights:
     ls_lt: 1.0
     ls_ht: 1.0
@@ -95,8 +96,8 @@ training:
 
 sampling:
   # Used by eval_stageA.py if CLI doesn't override
-  checkpoint: /home/jzx/K-Flow/runs/stageA_bandwise_pathB_1p15b_ucf101_320x240_25fps_f120/checkpoints/last.pt
-  out: /home/jzx/K-Flow/runs/stageA_bandwise_pathB_1p15b_ucf101_320x240_25fps_f120/samples/sample.mp4
+  checkpoint: /map-vepfs/zhengxuan/st-vk-flow/runs/stageA_bandwise_pathB_1p15b_ucf101_320x240_25fps_f120/checkpoints/last.pt
+  out: /map-vepfs/zhengxuan/st-vk-flow/runs/stageA_bandwise_pathB_1p15b_ucf101_320x240_25fps_f120/samples/sample.mp4
   steps_per_band: 32
   fps: 25
   seed: 42
@@ -104,24 +105,26 @@ sampling:
   ablate_band:
   ablate_scale: 1.0
   save_scale: 1.0
+  decode_dtype: bfloat16
 
 monitor:
   enabled: true
   every_epochs: 1
-  output_dir: /home/jzx/K-Flow/runs/stageA_bandwise_pathB_1p15b_ucf101_320x240_25fps_f120/monitor_samples
+  output_dir: /map-vepfs/zhengxuan/st-vk-flow/runs/stageA_bandwise_pathB_1p15b_ucf101_320x240_25fps_f120/monitor_samples
   num_samples: 1
   seed: 42
   class_label: 0
   steps_per_band: 32
   fps: 25
   save_scale: 1.0
+  decode_dtype: bfloat16
   ablate_bands: [ls_lt, ls_ht, hs_lt, hs_ht]
   ablate_scale: 1.0
 
 quality_monitor:
   enabled: false
-  real_manifest: /home/jzx/K-Flow/data_cache_ucf101_320x240_25fps_f120/val_manifest.jsonl
-  output_jsonl: /home/jzx/K-Flow/runs/stageA_bandwise_pathB_1p15b_ucf101_320x240_25fps_f120/quality_metrics.jsonl
+  real_manifest: /map-vepfs/zhengxuan/st-vk-flow/data/UCF101/data_cache_ucf101_320x240_25fps_f120/val_manifest.jsonl
+  output_jsonl: /map-vepfs/zhengxuan/st-vk-flow/runs/stageA_bandwise_pathB_1p15b_ucf101_320x240_25fps_f120/quality_metrics.jsonl
   num_samples: 64
   seed_start: 1000
   max_videos: 64

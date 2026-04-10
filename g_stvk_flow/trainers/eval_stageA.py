@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -75,6 +75,7 @@ def main() -> None:
     parser.add_argument("--ablate-scale", type=float, default=None)
     parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--save-scale", type=float, default=None)
+    parser.add_argument("--decode-dtype", type=str, default=None, help="override sampling.decode_dtype from config")
     args = parser.parse_args()
 
     cfg_path = args.config.resolve()
@@ -136,6 +137,11 @@ def main() -> None:
     class_label = args.class_label if args.class_label is not None else sampling_cfg.get("class_label", None)
     ablate_band = args.ablate_band if args.ablate_band is not None else sampling_cfg.get("ablate_band", None)
     ablate_scale = float(args.ablate_scale if args.ablate_scale is not None else sampling_cfg.get("ablate_scale", 1.0))
+    decode_dtype = _dtype_from_string(
+        args.decode_dtype
+        if args.decode_dtype is not None
+        else sampling_cfg.get("decode_dtype", vae_cfg.get("dtype", "float32"))
+    )
 
     raw_frames = int(cfg["data"]["frames"])
     raw_h, raw_w = _get_data_hw(cfg["data"])
@@ -168,6 +174,7 @@ def main() -> None:
             bands[ablate_band] = bands[ablate_band] + ablate_scale * torch.randn_like(bands[ablate_band])
             latent = decomposer.inverse(bands)
 
+        latent = latent.to(device=device, dtype=decode_dtype)
         video = vae.decode(latent)
 
     fps_default = cfg.get("data", {}).get("fps", 8)
