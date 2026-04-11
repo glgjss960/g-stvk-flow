@@ -5,6 +5,7 @@ import json
 import os
 import random
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +47,7 @@ def _env_int(name: str, default: int) -> int:
         return int(default)
 
 
-def _init_distributed_from_env() -> tuple[bool, int, int, int]:
+def _init_distributed_from_env(timeout_minutes: int = 60) -> tuple[bool, int, int, int]:
     world_size = _env_int("WORLD_SIZE", 1)
     rank = _env_int("RANK", 0)
     local_rank = _env_int("LOCAL_RANK", 0)
@@ -62,7 +63,8 @@ def _init_distributed_from_env() -> tuple[bool, int, int, int]:
 
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://")
+        timeout = timedelta(minutes=max(1, int(timeout_minutes)))
+        dist.init_process_group(backend="nccl", init_method="env://", timeout=timeout)
 
     return True, rank, local_rank, world_size
 
@@ -269,11 +271,18 @@ def _run_eval(
                         band_count[band_name] += 1
 
     model.train()
+    overall_sum, overall_count = _sync_sum_count(overall_sum, overall_count, device)
+    if eval_track_band_losses:
+        for name in band_names:
+            band_sum[name], band_count[name] = _sync_sum_count(band_sum[name], band_count[name], device)
+
     overall = overall_sum / max(overall_count, 1)
-    band_avg = {
-        name: (band_sum[name] / max(band_count[name], 1)) if band_count[name] > 0 else float("nan")
-        for name in band_names
-    }
+    band_avg: dict[str, float] = {}
+    if eval_track_band_losses:
+        band_avg = {
+            name: (band_sum[name] / max(band_count[name], 1)) if band_count[name] > 0 else float("nan")
+            for name in band_names
+        }
     return overall, band_avg
 
 
@@ -391,6 +400,8 @@ def main() -> None:
     cfg_path = args.config.resolve()
     cfg_root = cfg_path.parent
     cfg = _load_yaml(cfg_path)
+    train_cfg = cfg["training"]
+    ddp_timeout_minutes = int(train_cfg.get("ddp_timeout_minutes", 60))
 
     use_ddp = False
     rank = 0
@@ -398,7 +409,7 @@ def main() -> None:
     world_size = 1
 
     try:
-        use_ddp, rank, local_rank, world_size = _init_distributed_from_env()
+        use_ddp, rank, local_rank, world_size = _init_distributed_from_env(timeout_minutes=ddp_timeout_minutes)
         is_main = _is_main_process(rank)
 
         base_seed = int(cfg.get("seed", 42))
@@ -410,7 +421,10 @@ def main() -> None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         if is_main and use_ddp:
-            print(f"DDP enabled: world_size={world_size}, rank={rank}, local_rank={local_rank}")
+            print(
+                f"DDP enabled: world_size={world_size}, rank={rank}, local_rank={local_rank}, "
+                f"timeout={ddp_timeout_minutes}min"
+            )
 
         run_dir = _resolve(cfg_root, cfg["run"]["output_dir"])
         assert run_dir is not None
@@ -420,7 +434,6 @@ def main() -> None:
         metrics_path = run_dir / "metrics.jsonl"
 
         data_cfg = cfg["data"]
-        train_cfg = cfg["training"]
         monitor_cfg = cfg.get("monitor", {})
         vae_cfg = cfg.get("vae", {})
 
@@ -464,7 +477,16 @@ def main() -> None:
         )
 
         val_loader = None
-        if val_ds is not None and ((not use_ddp) or is_main):
+        val_sampler = None
+        if val_ds is not None:
+            if use_ddp:
+                val_sampler = DistributedSampler(
+                    val_ds,
+                    num_replicas=world_size,
+                    rank=rank,
+                    shuffle=bool(train_cfg.get("shuffle_val", False)),
+                    drop_last=bool(train_cfg.get("drop_last_val", False)),
+                )
             val_loader = _build_loader(
                 dataset=val_ds,
                 batch_size=batch_size,
@@ -472,7 +494,7 @@ def main() -> None:
                 is_train=False,
                 device=device,
                 train_cfg=train_cfg,
-                sampler=None,
+                sampler=val_sampler,
             )
 
         decomp_mode = str(cfg["decomposition"].get("mode", "spatial_temporal"))
@@ -594,6 +616,8 @@ def main() -> None:
         for epoch in range(start_epoch, epochs):
             if use_ddp and train_sampler is not None:
                 train_sampler.set_epoch(epoch)
+            if use_ddp and val_sampler is not None:
+                val_sampler.set_epoch(epoch)
 
             iterator = tqdm(train_loader, desc=f"stageA epoch {epoch}", leave=False) if is_main else train_loader
             running = 0.0

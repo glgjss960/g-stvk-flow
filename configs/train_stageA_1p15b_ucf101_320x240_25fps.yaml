@@ -82,6 +82,7 @@ training:
   amp: true
   log_every: 10
   save_every: 1
+  ddp_timeout_minutes: 60
   eval_full_bandwise: true
   eval_track_band_losses: true
 
@@ -109,12 +110,12 @@ sampling:
 
 monitor:
   enabled: true
-  every_epochs: 1
+  every_epochs: 10
   output_dir: /map-vepfs/zhengxuan/st-vk-flow/runs/stageA_bandwise_1p15b_ucf101_320x240_25fps_f120/monitor_samples
   num_samples: 1
   seed: 42
   class_label: 0
-  steps_per_band: 32
+  steps_per_band: 16
   fps: 25
   save_scale: 1.0
   decode_dtype: bfloat16
